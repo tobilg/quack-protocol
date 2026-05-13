@@ -1,0 +1,58 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Build and test
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Install DuckDB CLI
+        run: |
+          set -euo pipefail
+
+          duckdb_dir="${RUNNER_TEMP}/duckdb"
+          mkdir -p "${duckdb_dir}"
+
+          curl -fsSL "https://install.duckdb.org/v1.5.2/duckdb_cli-linux-amd64.zip" \
+            -o "${duckdb_dir}/duckdb_cli-linux-amd64.zip"
+          unzip -q "${duckdb_dir}/duckdb_cli-linux-amd64.zip" -d "${duckdb_dir}"
+          chmod +x "${duckdb_dir}/duckdb"
+
+          echo "${duckdb_dir}" >> "${GITHUB_PATH}"
+          echo "DUCKDB_BIN=${duckdb_dir}/duckdb" >> "${GITHUB_ENV}"
+          "${duckdb_dir}/duckdb" --version
+
+      - name: Integration tests
+        run: pnpm run test:integration

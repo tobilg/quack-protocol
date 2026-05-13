@@ -1,0 +1,137 @@
+name: Publish to npm
+
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    name: Build, test, and publish
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+          cache: pnpm
+
+      - name: Validate release tag
+        run: |
+          set -euo pipefail
+
+          tag="${GITHUB_REF_NAME}"
+          version="$(node -p "require('./package.json').version")"
+
+          if [[ ! "${tag}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "Release tags must use vX.X.X format, got ${tag}" >&2
+            exit 1
+          fi
+
+          if [[ "${tag}" != "v${version}" ]]; then
+            echo "Tag ${tag} does not match package.json version ${version}" >&2
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Test
+        run: pnpm run test
+
+      - name: Install DuckDB CLI
+        run: |
+          set -euo pipefail
+
+          duckdb_dir="${RUNNER_TEMP}/duckdb"
+          mkdir -p "${duckdb_dir}"
+
+          curl -fsSL "https://install.duckdb.org/v1.5.2/duckdb_cli-linux-amd64.zip" \
+            -o "${duckdb_dir}/duckdb_cli-linux-amd64.zip"
+          unzip -q "${duckdb_dir}/duckdb_cli-linux-amd64.zip" -d "${duckdb_dir}"
+          chmod +x "${duckdb_dir}/duckdb"
+
+          echo "${duckdb_dir}" >> "${GITHUB_PATH}"
+          echo "DUCKDB_BIN=${duckdb_dir}/duckdb" >> "${GITHUB_ENV}"
+          "${duckdb_dir}/duckdb" --version
+
+      - name: Integration tests
+        run: pnpm run test:integration
+
+      - name: Check package contents
+        run: pnpm pack --dry-run
+
+      - name: Publish
+        run: pnpm publish --access public --provenance --no-git-checks
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+  deploy-documentation:
+    name: Generate and deploy API documentation
+    runs-on: ubuntu-latest
+    needs: publish
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      deployments: write
+
+    env:
+      CLOUDFLARE_PAGES_PROJECT_NAME: ${{ vars.CLOUDFLARE_PAGES_PROJECT_NAME || 'quack-protocol-sdk-api' }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v6
+        with:
+          version: 10
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Build
+        run: pnpm run build
+
+      - name: Build API documentation
+        run: pnpm run docs:api
+
+      - name: Validate Cloudflare configuration
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: |
+          test -n "$CLOUDFLARE_API_TOKEN" || { echo "Missing CLOUDFLARE_API_TOKEN"; exit 1; }
+          test -n "$CLOUDFLARE_ACCOUNT_ID" || { echo "Missing CLOUDFLARE_ACCOUNT_ID"; exit 1; }
+          test -n "$CLOUDFLARE_PAGES_PROJECT_NAME" || { echo "Missing CLOUDFLARE_PAGES_PROJECT_NAME"; exit 1; }
+
+      - name: Deploy to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy api-docs --project-name ${{ env.CLOUDFLARE_PAGES_PROJECT_NAME }} --branch main

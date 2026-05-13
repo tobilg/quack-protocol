@@ -1,0 +1,53 @@
+{
+  "name": "@quack-protocol/sdk",
+  "version": "0.1.0",
+  "description": "TypeScript client and codecs for DuckDB's experimental Quack protocol",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    },
+    "./protocol": {
+      "types": "./dist/protocol.d.ts",
+      "import": "./dist/protocol.js"
+    }
+  },
+  "files": [
+    "dist/**/*.js",
+    "dist/**/*.d.ts"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json --noEmit && vite build && tsc -p tsconfig.build.json",
+    "docs:api": "typedoc",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:integration": "vitest run --config vitest.integration.config.ts",
+    "check:duckdb": "node ./scripts/check-duckdb.mjs",
+    "serve:quack": "bash ./scripts/start-quack-server.sh"
+  },
+  "keywords": [
+    "duckdb",
+    "quack",
+    "database"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tobilg/quack-protocol.git"
+  },
+  "bugs": {
+    "url": "https://github.com/tobilg/quack-protocol/issues"
+  },
+  "homepage": "https://github.com/tobilg/quack-protocol#readme",
+  "devDependencies": {
+    "typedoc": "^0.28.19",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.12",
+    "vitest": "^4.1.6"
+  },
+  "author": "TobiLG <github@tobilg.com>",
+  "license": "MIT"
+}

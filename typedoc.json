@@ -1,0 +1,17 @@
+{
+  "$schema": "https://typedoc.org/schema.json",
+  "name": "@quack-protocol/sdk",
+  "entryPoints": ["src/index.ts", "src/protocol.ts"],
+  "entryPointStrategy": "resolve",
+  "out": "api-docs",
+  "readme": "README.md",
+  "tsconfig": "tsconfig.json",
+  "includeVersion": true,
+  "excludeInternal": true,
+  "excludePrivate": true,
+  "excludeProtected": true,
+  "navigationLinks": {
+    "GitHub": "https://github.com/tobilg/quack-protocol",
+    "npm": "https://www.npmjs.com/package/@quack-protocol/sdk"
+  }
+}
