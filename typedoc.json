@@ -3,6 +3,7 @@
   "name": "@quack-protocol/sdk",
   "entryPoints": ["src/index.ts", "src/protocol.ts"],
   "entryPointStrategy": "resolve",
+  "router": "structure-dir",
   "out": "api-docs",
   "readme": "README.md",
   "tsconfig": "tsconfig.json",
