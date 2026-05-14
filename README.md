@@ -11,7 +11,7 @@ browsers, Node, and other runtimes with a compatible fetch implementation.
 Quack is still experimental upstream. The protocol is tightly coupled to
 DuckDB's internal binary serialization format. The implementation here targets
 the wire format documented in
-[Quack protocol analysis](https://gist.github.com/tobilg/7afba467aba903652345ae39eb8a0d57).
+[Quack protocol analysis](https://gist.github.com/tobilg/9ced9d08f6141b723f26cf205d5b9ece).
 
 ## Status
 
