@@ -7,6 +7,7 @@
  * @packageDocumentation
  */
 export * from "./binary";
+export * from "./arrow";
 export * from "./builders";
 export * from "./client";
 export * from "./constants";

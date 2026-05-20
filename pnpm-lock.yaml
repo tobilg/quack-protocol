@@ -7,6 +7,10 @@ settings:
 importers:
 
   .:
+    dependencies:
+      '@uwdata/flechette':
+        specifier: 2.5.0
+        version: 2.5.0
     devDependencies:
       typedoc:
         specifier: ^0.28.19
@@ -180,6 +184,9 @@ packages:
 
   '@types/unist@3.0.3':
     resolution: {integrity: sha512-ko/gIFJRv177XgZsZcBwnqJN5x/Gien8qNOn0D5bQU/zAzVf9Zt3BlcUiLqhV9y4ARk0GbT3tnUiPNgnTXzc/Q==}
+
+  '@uwdata/flechette@2.5.0':
+    resolution: {integrity: sha512-NSB9xIPVsxpEcnEvtLfbvH/tEqZWiD4bfdz/yBUAUBEe0Z0C3zmA/Y4GOCsLZe4ChxiHaedFBZzVdUxQ+NVcMA==}
 
   '@vitest/expect@4.1.6':
     resolution: {integrity: sha512-7EHDquPthALSV0jhhjgEW8FXaviMx7rSqu8W6oqCoAuOhKov814P99QDV1pxMA3QPv21YudvJngIhjrNI4opLg==}
@@ -658,6 +665,8 @@ snapshots:
       '@types/unist': 3.0.3
 
   '@types/unist@3.0.3': {}
+
+  '@uwdata/flechette@2.5.0': {}
 
   '@vitest/expect@4.1.6':
     dependencies:

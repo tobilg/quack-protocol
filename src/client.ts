@@ -15,6 +15,14 @@ import { formatSql } from "./sql";
 import type { SqlParameters } from "./sql";
 import { chunksToRows } from "./vector";
 import type { QuackDataChunk, QuackRow, QuackValue } from "./vector";
+import {
+  arrowIPCFromTable,
+  arrowTableFromChunks,
+  arrowTableFromDataChunk,
+  dataChunksFromArrow
+} from "./arrow";
+import type { QuackArrowAppendOptions, QuackArrowInput, QuackArrowIPCOptions, QuackArrowTableOptions } from "./arrow";
+import type { Table as ArrowTable } from "@uwdata/flechette";
 
 /** Options that apply to an individual Quack HTTP request. */
 export interface QuackRequestOptions {
@@ -107,6 +115,17 @@ export interface QuackQueryResult<T extends QuackRow = QuackRow> {
   /** Materialize rows and convert Quack-specific values to JSON-safe values. */
   jsonRows(options?: QuackJsonOptions): QuackJsonRow[];
 }
+
+/** Options accepted by Arrow query and streaming methods. */
+export interface QuackArrowQueryOptions extends QuackQueryOptions, QuackArrowTableOptions {}
+
+/** Options accepted by Arrow IPC query methods. */
+export interface QuackArrowQueryIPCOptions extends QuackQueryOptions, QuackArrowIPCOptions {}
+
+/** Options accepted by Arrow append methods. */
+export interface AppendArrowOptions extends AppendOptions, QuackArrowAppendOptions {}
+
+type NormalizedArrowQueryOptions = Omit<QuackArrowQueryIPCOptions, "params"> & { params: SqlParameters | undefined };
 
 /** Client for DuckDB's Quack HTTP protocol. */
 export class QuackClient {
@@ -238,6 +257,40 @@ export class QuackClient {
     };
   }
 
+  /** Run SQL and collect the result as a Flechette Arrow Table. */
+  async queryArrow(sql: string, options?: QuackArrowQueryOptions): Promise<ArrowTable>;
+  async queryArrow(
+    sql: string,
+    params: SqlParameters,
+    options?: QuackArrowQueryOptions
+  ): Promise<ArrowTable>;
+  async queryArrow(
+    sql: string,
+    paramsOrOptions?: SqlParameters | QuackArrowQueryOptions,
+    requestOptions?: QuackArrowQueryOptions
+  ): Promise<ArrowTable> {
+    const options = normalizeArrowQueryOptions(paramsOrOptions, requestOptions);
+    const result = await this.query(sql, options as QuackQueryOptions);
+    return arrowTableFromChunks(result.chunks, result.names, { ...options, duckTypes: result.types });
+  }
+
+  /** Run SQL and collect the result as Arrow IPC bytes. */
+  async queryArrowIPC(sql: string, options?: QuackArrowQueryIPCOptions): Promise<Uint8Array>;
+  async queryArrowIPC(
+    sql: string,
+    params: SqlParameters,
+    options?: QuackArrowQueryIPCOptions
+  ): Promise<Uint8Array>;
+  async queryArrowIPC(
+    sql: string,
+    paramsOrOptions?: SqlParameters | QuackArrowQueryIPCOptions,
+    requestOptions?: QuackArrowQueryIPCOptions
+  ): Promise<Uint8Array> {
+    const options = normalizeArrowQueryOptions(paramsOrOptions, requestOptions) as QuackArrowQueryIPCOptions;
+    const table = await this.queryArrow(sql, options);
+    return arrowIPCFromTable(table, options);
+  }
+
   /** Run SQL and return the first row, or `null` when the result is empty. */
   async first<T extends QuackRow = QuackRow>(sql: string, options?: QuackQueryOptions): Promise<T | null>;
   async first<T extends QuackRow = QuackRow>(
@@ -336,6 +389,20 @@ export class QuackClient {
     }
   }
 
+  /** Run SQL and stream result chunks as Flechette Arrow Tables. */
+  streamArrow(sql: string, options?: QuackArrowQueryOptions): AsyncGenerator<ArrowTable, void, void>;
+  streamArrow(sql: string, params: SqlParameters, options?: QuackArrowQueryOptions): AsyncGenerator<ArrowTable, void, void>;
+  async *streamArrow(
+    sql: string,
+    paramsOrOptions?: SqlParameters | QuackArrowQueryOptions,
+    requestOptions?: QuackArrowQueryOptions
+  ): AsyncGenerator<ArrowTable, void, void> {
+    const options = normalizeArrowQueryOptions(paramsOrOptions, requestOptions);
+    for await (const chunk of this.stream(sql, options as QuackQueryOptions)) {
+      yield arrowTableFromDataChunk(chunk, chunk.columnNames, options);
+    }
+  }
+
   /** Append an already encoded DuckDB DataChunk to a table. */
   async append(table: string, chunk: QuackDataChunk, schemaName?: string): Promise<void>;
   async append(table: string, chunk: QuackDataChunk, options?: AppendOptions): Promise<void>;
@@ -391,6 +458,17 @@ export class QuackClient {
     for (let offset = 0; offset < rows.length; offset += batchSize) {
       const batch = rows.slice(offset, offset + batchSize);
       await this.append(table, dataChunkFromRows(batch, chunkOptions), options);
+    }
+  }
+
+  /** Append data from a Flechette Arrow Table or Arrow IPC bytes. */
+  async appendArrow(
+    table: string | TableReference,
+    input: QuackArrowInput,
+    options: AppendArrowOptions = {}
+  ): Promise<void> {
+    for (const chunk of dataChunksFromArrow(input, options)) {
+      await this.append(table, chunk, options);
     }
   }
 
@@ -628,6 +706,38 @@ function normalizeQueryOptions(
     return { ...paramsOrOptions, ...requestOptions };
   }
   return { ...requestOptions, params: paramsOrOptions };
+}
+
+function normalizeArrowQueryOptions(
+  paramsOrOptions: SqlParameters | QuackArrowQueryOptions | QuackArrowQueryIPCOptions | undefined,
+  requestOptions: QuackArrowQueryOptions | QuackArrowQueryIPCOptions | undefined
+): NormalizedArrowQueryOptions {
+  if (paramsOrOptions === undefined) {
+    return (requestOptions ? { ...requestOptions, params: requestOptions.params } : { params: undefined }) as NormalizedArrowQueryOptions;
+  }
+  if (Array.isArray(paramsOrOptions)) {
+    return { ...requestOptions, params: paramsOrOptions } as NormalizedArrowQueryOptions;
+  }
+  if (isArrowQueryOptions(paramsOrOptions)) {
+    const merged = { ...paramsOrOptions, ...requestOptions };
+    return { ...merged, params: merged.params } as NormalizedArrowQueryOptions;
+  }
+  return { ...requestOptions, params: paramsOrOptions } as NormalizedArrowQueryOptions;
+}
+
+function isArrowQueryOptions(value: object): value is QuackArrowQueryOptions | QuackArrowQueryIPCOptions {
+  return (
+    isQueryOptions(value) ||
+    "useDate" in value ||
+    "useDecimalInt" in value ||
+    "useBigInt" in value ||
+    "useBigIntTimestamp" in value ||
+    "useMap" in value ||
+    "useProxy" in value ||
+    "duckTypes" in value ||
+    "format" in value ||
+    "codec" in value
+  );
 }
 
 function isQueryOptions(value: object): value is QuackQueryOptions {

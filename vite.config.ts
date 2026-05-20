@@ -11,6 +11,9 @@ export default defineConfig({
       fileName: (_format, entryName) => `${entryName}.js`,
       formats: ["es"]
     },
+    rollupOptions: {
+      external: ["@uwdata/flechette"]
+    },
     sourcemap: false,
     target: "es2022"
   }

@@ -191,6 +191,59 @@ await client.transaction(async (tx) => {
 });
 ```
 
+## Arrow Results
+
+The SDK can expose query results as Apache Arrow data through
+`@uwdata/flechette`:
+
+```ts
+const table = await client.queryArrow(
+  "SELECT 1::INTEGER AS id, 12.34::DECIMAL(10, 2) AS amount",
+  {
+    useDecimalInt: true,
+    useBigInt: true,
+    useBigIntTimestamp: true
+  }
+);
+
+console.log(table.numRows);
+console.log(table.toColumns());
+console.log(table.toArray());
+```
+
+`queryArrow()` accepts the same SQL parameter forms as `query()`, plus
+Flechette extraction options: `useDate`, `useDecimalInt`, `useBigInt`,
+`useBigIntTimestamp`, `useMap`, and `useProxy`.
+
+Use `queryArrowIPC()` to collect results as Arrow IPC bytes:
+
+```ts
+const ipc = await client.queryArrowIPC("SELECT * FROM items", {
+  format: "stream",
+  useBigInt: true
+});
+```
+
+For chunk-by-chunk Arrow processing, use `streamArrow()`:
+
+```ts
+for await (const table of client.streamArrow("SELECT * FROM range(10000)")) {
+  console.log(table.numRows, table.names);
+}
+```
+
+Low-level conversion helpers are exported for callers that already have Quack
+chunks or Flechette tables:
+
+```ts
+import {
+  arrowIPCFromChunks,
+  arrowTableFromChunks,
+  dataChunksFromArrowIPC,
+  dataChunksFromArrowTable
+} from "@quack-protocol/sdk";
+```
+
 ## Appending Data
 
 For application code, `appendRows()` is the most convenient append API:
@@ -258,6 +311,43 @@ await client.append("target_table", chunk);
 ```ts
 await client.append({ schema: "analytics", table: "items" }, chunk);
 ```
+
+Arrow tables and Arrow IPC bytes can also be appended:
+
+```ts
+import { decimal128, int32, tableFromArrays, utf8 } from "@uwdata/flechette";
+import { LogicalTypes } from "@quack-protocol/sdk";
+
+const arrow = tableFromArrays(
+  {
+    id: [1, 2],
+    label: ["one", "two"],
+    amount: [1234n, null]
+  },
+  {
+    types: {
+      id: int32(),
+      label: utf8(),
+      amount: decimal128(10, 2)
+    },
+    useDecimalInt: true
+  }
+);
+
+await client.appendArrow("target_table", arrow, {
+  duckTypes: {
+    id: LogicalTypes.integer(),
+    label: LogicalTypes.varchar(),
+    amount: LogicalTypes.decimal(10, 2)
+  },
+  useDecimalInt: true
+});
+```
+
+Arrow data produced by this SDK includes DuckDB logical type metadata, so it can
+usually be appended back without `duckTypes`. External Arrow data should provide
+`duckTypes` when a DuckDB target type is ambiguous, for example decimals,
+enums, UUIDs, or temporal precision.
 
 The builder keeps column names on the local chunk for row materialization, but
 Quack append uses the target table schema and column order.
