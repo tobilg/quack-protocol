@@ -1,8 +1,9 @@
-import { tableFromIPC } from "@uwdata/flechette";
+import { field, int32, tableFromIPC, Table, Version, Endianness, runEndEncoded } from "@uwdata/flechette";
 import { describe, expect, it } from "vitest";
 import {
   arrowIPCFromChunks,
   arrowTableFromDataChunk,
+  arrowTableFromChunks,
   column,
   dataChunk,
   dataChunksFromArrowIPC,
@@ -10,7 +11,8 @@ import {
   ExtraTypeInfoType,
   LogicalTypeId,
   LogicalTypes,
-  logicalType
+  logicalType,
+  QuackUnsupportedTypeError
 } from "../src";
 
 describe("Arrow conversion helpers", () => {
@@ -95,5 +97,80 @@ describe("Arrow conversion helpers", () => {
       [9007199254740993n, null],
       [{ kind: "timestamp", unit: "micros", value: 1234567n }, null]
     ]);
+  });
+
+  it("preserves zero-row Arrow table schemas", () => {
+    const table = arrowTableFromChunks(
+      [],
+      ["id", "label"],
+      {
+        duckTypes: [LogicalTypes.integer(), LogicalTypes.varchar()]
+      }
+    );
+
+    expect(table.numRows).toBe(0);
+    expect(table.names).toEqual(["id", "label"]);
+    expect(table.schema.fields.map((field) => field.type.typeId)).toEqual([2, 5]);
+
+    const [chunk] = dataChunksFromArrowTable(table);
+    expect(chunk?.rowCount).toBe(0);
+    expect(chunk?.types.map((type) => type.id)).toEqual([LogicalTypeId.INTEGER, LogicalTypeId.VARCHAR]);
+    expect(chunk?.columnNames).toEqual(["id", "label"]);
+  });
+
+  it("round-trips Arrow IPC file format and special DuckDB scalar metadata", () => {
+    const enumType = LogicalTypes.enum(["sad", "ok", "happy"]);
+    const chunk = dataChunk([
+      column(LogicalTypes.uuid(), ["00112233-4455-6677-8899-aabbccddeeff"], "uuid_v"),
+      column(enumType, ["happy"], "enum_v"),
+      column(LogicalTypes.blob(), [new Uint8Array([1, 2, 3])], "blob_v"),
+      column(LogicalTypes.timeTz(), [{ kind: "time_tz", bits: 123n }], "timetz_v"),
+      column(LogicalTypes.decimal(38, 4), [{ kind: "decimal", value: 1234567890123456789012345678901234n, width: 38, scale: 4 }], "huge_dec_v")
+    ]);
+
+    const ipc = arrowIPCFromChunks([chunk], chunk.columnNames, {
+      duckTypes: chunk.types,
+      format: "file",
+      useDecimalInt: true,
+      useBigInt: true
+    });
+    const table = tableFromIPC(ipc, { useDecimalInt: true, useBigInt: true });
+    expect(table.at(0)).toMatchObject({
+      uuid_v: "00112233-4455-6677-8899-aabbccddeeff",
+      enum_v: "happy",
+      timetz_v: 123n,
+      huge_dec_v: 1234567890123456789012345678901234n
+    });
+    expect(table.getChild("blob_v").at(0)).toEqual(new Uint8Array([1, 2, 3]));
+
+    const [roundTripped] = dataChunksFromArrowIPC(ipc, { useDecimalInt: true, useBigInt: true });
+    expect(roundTripped?.types.map((type) => type.id)).toEqual([
+      LogicalTypeId.UUID,
+      LogicalTypeId.ENUM,
+      LogicalTypeId.BLOB,
+      LogicalTypeId.TIME_TZ,
+      LogicalTypeId.DECIMAL
+    ]);
+    expect(roundTripped?.columns.map((col) => col.values)).toEqual([
+      ["00112233-4455-6677-8899-aabbccddeeff"],
+      ["happy"],
+      [new Uint8Array([1, 2, 3])],
+      [{ kind: "time_tz", bits: 123n }],
+      [1234567890123456789012345678901234n]
+    ]);
+  });
+
+  it("fails clearly for unsupported Arrow types", () => {
+    const unsupported = new Table(
+      {
+        version: Version.V5,
+        endianness: Endianness.Little,
+        fields: [field("encoded", runEndEncoded(field("run_ends", int32()), field("values", int32())))],
+        metadata: null
+      },
+      []
+    );
+
+    expect(() => dataChunksFromArrowTable(unsupported)).toThrow(QuackUnsupportedTypeError);
   });
 });
