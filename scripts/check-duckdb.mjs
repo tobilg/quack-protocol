@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
 
-const minimum = [1, 5, 2];
+const minimum = [2, 0, 0];
 
 try {
-  const output = execFileSync("duckdb", ["--version"], { encoding: "utf8" }).trim();
+  const output = execFileSync(process.env.DUCKDB_BIN || "duckdb", ["--version"], { encoding: "utf8" }).trim();
   const match = output.match(/v?(\d+)\.(\d+)\.(\d+)/);
   if (!match) {
     throw new Error(`Could not parse DuckDB version from: ${output}`);

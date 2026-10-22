@@ -9,8 +9,8 @@ importers:
   .:
     dependencies:
       '@uwdata/flechette':
-        specifier: 2.5.0
-        version: 2.5.0
+        specifier: 2.7.0
+        version: 2.7.0
     devDependencies:
       typedoc:
         specifier: ^0.28.19
@@ -185,8 +185,11 @@ packages:
   '@types/unist@3.0.3':
     resolution: {integrity: sha512-ko/gIFJRv177XgZsZcBwnqJN5x/Gien8qNOn0D5bQU/zAzVf9Zt3BlcUiLqhV9y4ARk0GbT3tnUiPNgnTXzc/Q==}
 
-  '@uwdata/flechette@2.5.0':
-    resolution: {integrity: sha512-NSB9xIPVsxpEcnEvtLfbvH/tEqZWiD4bfdz/yBUAUBEe0Z0C3zmA/Y4GOCsLZe4ChxiHaedFBZzVdUxQ+NVcMA==}
+  '@uwdata/flechette@2.7.0':
+    resolution: {integrity: sha512-+d4JwDnBJsxjH7zMz5QSDOVQQYqFdAQYSaR6lfBazFz28C5eIBiL5s4jqLEWJKcc43fSU1m6yHMcWeRUCTNH+g==}
+
+  '@uwdata/wk-geojson@0.0.1':
+    resolution: {integrity: sha512-4RpnKbdrphwzP+BwgzuGRqA/s03oT1rzHAKdU43Ozn8J1BCTwS+2iAGQ7YQAnrCkCi213WtQ7VYaFjVtvZotPQ==}
 
   '@vitest/expect@4.1.6':
     resolution: {integrity: sha512-7EHDquPthALSV0jhhjgEW8FXaviMx7rSqu8W6oqCoAuOhKov814P99QDV1pxMA3QPv21YudvJngIhjrNI4opLg==}
@@ -666,7 +669,11 @@ snapshots:
 
   '@types/unist@3.0.3': {}
 
-  '@uwdata/flechette@2.5.0': {}
+  '@uwdata/flechette@2.7.0':
+    dependencies:
+      '@uwdata/wk-geojson': 0.0.1
+
+  '@uwdata/wk-geojson@0.0.1': {}
 
   '@vitest/expect@4.1.6':
     dependencies:

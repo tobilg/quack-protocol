@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { formatSql, sqlLiteral } from "../src/sql";
+import { LogicalTypes } from "../src/logical-types";
+import { formatSql, logicalTypeToSql, quoteIdentifier, sqlLiteral } from "../src/sql";
 import { dateFromISODate, intervalValue, timestampValue } from "../src/values";
 
 describe("SQL parameter formatting", () => {
@@ -30,5 +31,33 @@ describe("SQL parameter formatting", () => {
   it("throws for placeholder count mismatches and undefined values", () => {
     expect(() => formatSql("SELECT ?, ?", [1])).toThrow();
     expect(() => formatSql("SELECT ?", [undefined])).toThrow();
+  });
+});
+
+describe("SQL type rendering", () => {
+  it("quotes identifiers", () => {
+    expect(quoteIdentifier("items")).toBe('"items"');
+    expect(quoteIdentifier('we"ird')).toBe('"we""ird"');
+  });
+
+  it("renders DuckDB type text for append prototypes", () => {
+    expect(logicalTypeToSql(LogicalTypes.decimal(10, 3))).toBe("DECIMAL(10,3)");
+    expect(logicalTypeToSql(LogicalTypes.timestampSeconds())).toBe("TIMESTAMP_S");
+    expect(logicalTypeToSql(LogicalTypes.timestampTz())).toBe("TIMESTAMP WITH TIME ZONE");
+    expect(logicalTypeToSql(LogicalTypes.timestampTzNanos())).toBe("TIMESTAMPTZ_NS");
+    expect(logicalTypeToSql(LogicalTypes.timeTz())).toBe("TIME WITH TIME ZONE");
+    expect(logicalTypeToSql(LogicalTypes.null())).toBe('"NULL"');
+    expect(logicalTypeToSql(LogicalTypes.array(LogicalTypes.list(LogicalTypes.integer()), 2))).toBe("INTEGER[][2]");
+    expect(logicalTypeToSql(LogicalTypes.map(LogicalTypes.varchar(), LogicalTypes.double()))).toBe("MAP(VARCHAR, DOUBLE)");
+    expect(logicalTypeToSql(LogicalTypes.enum(["it's", "ok"]))).toBe("ENUM('it''s', 'ok')");
+    expect(
+      logicalTypeToSql(
+        LogicalTypes.struct([
+          { name: "a b", type: LogicalTypes.integer() },
+          { name: "c", type: LogicalTypes.tuple([LogicalTypes.uuid(), LogicalTypes.blob()]) }
+        ])
+      )
+    ).toBe('STRUCT("a b" INTEGER, "c" TUPLE(UUID, BLOB))');
+    expect(logicalTypeToSql(LogicalTypes.geometry({ definition: "EPSG:4326" }))).toBe("GEOMETRY('EPSG:4326')");
   });
 });

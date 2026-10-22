@@ -1,0 +1,11 @@
+[submodule "references/duckdb-quack"]
+	path = references/duckdb-quack
+	url = https://github.com/duckdb/duckdb-quack
+[submodule "references/flechette"]
+	path = references/flechette
+	url = https://github.com/uwdata/flechette
+[submodule "references/duckdb"]
+	path = references/duckdb
+	url = https://github.com/duckdb/duckdb
+	branch = v2.0-cyanoptera
+	shallow = true

@@ -119,10 +119,10 @@ function quackUriToHttpBase(uri) {
     if (end < 0) {
       throw new Error(`Invalid Quack URI: ${uri}`);
     }
-    const host = rest.slice(0, end + 1);
+    const host = rest.slice(1, end);
     const suffix = rest.slice(end + 1);
     const port = suffix.startsWith(":") ? suffix.slice(1) : "9494";
-    return `http://${host}:${port}`;
+    return `${httpScheme(host)}://[${host}]:${port}`;
   }
 
   const parts = rest.split(":");
@@ -131,7 +131,12 @@ function quackUriToHttpBase(uri) {
   }
   const host = parts[0];
   const port = parts[1] ?? "9494";
-  return `http://${host}:${port}`;
+  return `${httpScheme(host)}://${host}:${port}`;
+}
+
+// quack_serve listens on plain HTTP for local hosts and HTTPS otherwise
+function httpScheme(host) {
+  return host.toLowerCase() === "localhost" || host === "127.0.0.1" || host === "::1" ? "http" : "https";
 }
 
 function sleep(ms) {

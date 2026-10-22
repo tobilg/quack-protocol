@@ -177,7 +177,7 @@ function inferLogicalType(values: readonly unknown[]): LogicalType {
       case "millis":
         return LogicalTypes.timestampMillis();
       case "nanos":
-        return LogicalTypes.timestampNanos();
+        return value.timezone === "utc" ? LogicalTypes.timestampTzNanos() : LogicalTypes.timestampNanos();
       default:
         return value.timezone === "utc" ? LogicalTypes.timestampTz() : LogicalTypes.timestamp();
     }
@@ -209,7 +209,7 @@ function normalizeAppendValue(value: unknown, type: LogicalType): QuackValue {
       return dateFromJSDate(value);
     }
     if (isTimestampLogicalType(type)) {
-      return timestampFromJSDate(value, timestampUnitForType(type), type.id === LogicalTypeId.TIMESTAMP_TZ ? "utc" : undefined);
+      return timestampFromJSDate(value, timestampUnitForType(type), isTimestampTzLogicalType(type) ? "utc" : undefined);
     }
   }
   if (Array.isArray(value)) {
@@ -240,8 +240,12 @@ function isTimestampLogicalType(type: LogicalType): boolean {
     type.id === LogicalTypeId.TIMESTAMP_SEC ||
     type.id === LogicalTypeId.TIMESTAMP_MS ||
     type.id === LogicalTypeId.TIMESTAMP_NS ||
-    type.id === LogicalTypeId.TIMESTAMP_TZ
+    isTimestampTzLogicalType(type)
   );
+}
+
+function isTimestampTzLogicalType(type: LogicalType): boolean {
+  return type.id === LogicalTypeId.TIMESTAMP_TZ || type.id === LogicalTypeId.TIMESTAMP_TZ_NS;
 }
 
 function timestampUnitForType(type: LogicalType): "seconds" | "millis" | "micros" | "nanos" {
@@ -251,6 +255,7 @@ function timestampUnitForType(type: LogicalType): "seconds" | "millis" | "micros
     case LogicalTypeId.TIMESTAMP_MS:
       return "millis";
     case LogicalTypeId.TIMESTAMP_NS:
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
       return "nanos";
     default:
       return "micros";

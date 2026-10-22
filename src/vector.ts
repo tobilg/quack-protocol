@@ -28,7 +28,8 @@ export enum VectorType {
   FSST = 1,
   CONSTANT = 2,
   DICTIONARY = 3,
-  SEQUENCE = 4
+  SEQUENCE = 4,
+  SHREDDED = 5
 }
 
 /** Tagged value used for DuckDB DECIMAL values. */
@@ -252,6 +253,8 @@ function decodeVectorBody(reader: BinaryReader, type: LogicalType, count: number
       return decodeFlatVectorBody(reader, type, count, vectorType);
     case VectorType.FSST:
       throw new QuackUnsupportedTypeError("FSST-compressed vectors are not supported by quack-ts");
+    case VectorType.SHREDDED:
+      throw new QuackUnsupportedTypeError("Shredded VARIANT vectors are not supported by quack-ts; cast VARIANT values to VARCHAR or JSON");
     case VectorType.CONSTANT: {
       const decoded = decodeVectorBody(reader, type, count > 0 ? 1 : 0);
       const value = decoded.values[0] ?? null;
@@ -305,7 +308,7 @@ function decodeFlatVectorBody(reader: BinaryReader, type: LogicalType, count: nu
 
   switch (physicalType) {
     case PhysicalType.VARCHAR: {
-      const rawValues = reader.readRequiredField(102, () => reader.readList(() => reader.readStringBytes()));
+      const rawValues = reader.peekFieldId() === 107 ? readStringBlobs(reader, count) : readStringList(reader, count);
       const values = rawValues.map((raw, index) => (isValid(validity, index) ? decodeStringLikeValue(type, raw) : null));
       return { type, vectorType, values };
     }
@@ -323,6 +326,9 @@ function decodeFlatVectorBody(reader: BinaryReader, type: LogicalType, count: nu
       const values = Array.from({ length: count }, (_, rowIndex) => {
         if (!isValid(validity, rowIndex)) {
           return null;
+        }
+        if (type.id === LogicalTypeId.TUPLE) {
+          return childVectors.map((childVector) => childVector.values[rowIndex] ?? null);
         }
         const row: Record<string, QuackValue> = {};
         for (let childIndex = 0; childIndex < children.length; childIndex++) {
@@ -398,9 +404,16 @@ function encodeFlatVectorBody(writer: BinaryWriter, type: LogicalType, values: r
   }
 
   switch (physicalType) {
-    case PhysicalType.VARCHAR:
-      writer.writeField(102, () => writer.writeList(values, (value) => writer.writeStringBytes(encodeStringLikeValue(type, value))));
+    case PhysicalType.VARCHAR: {
+      const encoded = values.map((value) => encodeStringLikeValue(type, value));
+      if (type.id === LogicalTypeId.GEOMETRY) {
+        // GEOMETRY keeps the WKB list layout
+        writer.writeField(102, () => writer.writeList(encoded, (bytes) => writer.writeStringBytes(bytes)));
+      } else {
+        writeStringBlobs(writer, encoded);
+      }
       return;
+    }
     case PhysicalType.STRUCT:
       encodeStructVectorBody(writer, type, values, count);
       return;
@@ -589,9 +602,13 @@ function encodeStringLikeValue(type: LogicalType, value: QuackValue): Uint8Array
 
 function encodeStructVectorBody(writer: BinaryWriter, type: LogicalType, values: readonly QuackValue[], count: number): void {
   const children = getStructChildren(type);
+  const tuple = type.id === LogicalTypeId.TUPLE;
   writer.writeField(103, () =>
-    writer.writeList(children, (child) => {
+    writer.writeList(children, (child, childIndex) => {
       const childValues = values.map((value) => {
+        if (tuple && Array.isArray(value)) {
+          return value[childIndex] ?? null;
+        }
         if (value === null || Array.isArray(value) || typeof value !== "object" || value instanceof Uint8Array) {
           return null;
         }
@@ -643,6 +660,58 @@ function encodeArrayVectorBody(writer: BinaryWriter, type: LogicalType, values: 
   writer.writeField(104, () => encodeVector(writer, childType, childValues, childValues.length));
 }
 
+function readStringList(reader: BinaryReader, count: number): Uint8Array[] {
+  const values = reader.readRequiredField(102, () => reader.readList(() => reader.readStringBytes()));
+  if (values.length !== count) {
+    throw new QuackProtocolError(`String vector serialized ${values.length} entries for ${count} rows`);
+  }
+  return values;
+}
+
+/** Read the DuckDB 2.0 string layout: a u32 length per row followed by the concatenated bytes. */
+function readStringBlobs(reader: BinaryReader, count: number): Uint8Array[] {
+  const byteLength = reader.readRequiredField(107, () => reader.readUlebNumber());
+  const lengths = reader.readRequiredField(108, () => reader.readBlob());
+  const data = reader.readRequiredField(109, () => reader.readBlob());
+  if (lengths.byteLength !== count * 4) {
+    throw new QuackProtocolError(`String length data has ${lengths.byteLength} bytes, expected ${count * 4}`);
+  }
+  if (data.byteLength !== byteLength) {
+    throw new QuackProtocolError(`String byte data has ${data.byteLength} bytes, expected ${byteLength}`);
+  }
+  const view = new DataView(lengths.buffer, lengths.byteOffset, lengths.byteLength);
+  const values: Uint8Array[] = [];
+  let offset = 0;
+  for (let index = 0; index < count; index++) {
+    const length = view.getUint32(index * 4, true);
+    if (offset + length > data.byteLength) {
+      throw new QuackProtocolError("String lengths exceed the serialized string data");
+    }
+    values.push(data.subarray(offset, offset + length));
+    offset += length;
+  }
+  return values;
+}
+
+function writeStringBlobs(writer: BinaryWriter, values: readonly Uint8Array[]): void {
+  const lengths = new Uint8Array(values.length * 4);
+  const view = new DataView(lengths.buffer);
+  let byteLength = 0;
+  values.forEach((bytes, index) => {
+    view.setUint32(index * 4, bytes.byteLength, true);
+    byteLength += bytes.byteLength;
+  });
+  const data = new Uint8Array(byteLength);
+  let offset = 0;
+  for (const bytes of values) {
+    data.set(bytes, offset);
+    offset += bytes.byteLength;
+  }
+  writer.writeField(107, () => writer.writeUleb(byteLength));
+  writer.writeField(108, () => writer.writeBlob(lengths));
+  writer.writeField(109, () => writer.writeBlob(data));
+}
+
 function readSelectionVector(reader: BinaryReader, count: number): number[] {
   const expectedBytes = count * 4;
   const bytes = reader.readBlob();
@@ -666,11 +735,12 @@ function readValidityMask(reader: BinaryReader, count: number): boolean[] {
 }
 
 function writeValidityMask(validity: readonly boolean[]): Uint8Array {
-  const bytes = new Uint8Array(validityMaskSize(validity.length));
+  // like DuckDB, start all-valid so the padding bits past the row count are set
+  const bytes = new Uint8Array(validityMaskSize(validity.length)).fill(0xff);
   for (let index = 0; index < validity.length; index++) {
-    if (validity[index]) {
+    if (!validity[index]) {
       const byteIndex = Math.floor(index / 8);
-      bytes[byteIndex] = (bytes[byteIndex] ?? 0) | (1 << (index % 8));
+      bytes[byteIndex] = (bytes[byteIndex] ?? 0) & ~(1 << (index % 8));
     }
   }
   return bytes;
@@ -749,6 +819,8 @@ function decodeInt64LogicalValue(type: LogicalType, value: bigint): QuackValue {
       return { kind: "timestamp", unit: "nanos", value };
     case LogicalTypeId.TIMESTAMP_TZ:
       return { kind: "timestamp", unit: "micros", value, timezone: "utc" };
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
+      return { kind: "timestamp", unit: "nanos", value, timezone: "utc" };
     case LogicalTypeId.DECIMAL:
       return decimalFromUnscaled(type, value);
     default:

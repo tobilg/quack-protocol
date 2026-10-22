@@ -16,16 +16,35 @@ export class QuackProtocolError extends QuackError {
   }
 }
 
+/** Structured details carried by a Quack error response. */
+export interface QuackServerErrorDetails {
+  /** DuckDB exception type name, such as `Catalog` or `Invalid Input`. */
+  exceptionType?: string;
+  /** Additional DuckDB error metadata. */
+  extraInfo?: Record<string, string>;
+  /** Whether the server's database has been invalidated. */
+  mustInvalidate?: boolean;
+}
+
 /** Error raised when the server returns a Quack error response. */
 export class QuackServerError extends QuackError {
-  /** Server-provided error message. */
+  /** Server-provided error message, without the exception type prefix. */
   readonly serverMessage: string;
+  /** DuckDB exception type name, such as `Catalog` or `Invalid Input`. */
+  readonly exceptionType: string | undefined;
+  /** Additional DuckDB error metadata. */
+  readonly extraInfo: Record<string, string>;
+  /** Whether the server's database has been invalidated; the client cannot be used afterwards. */
+  readonly mustInvalidate: boolean;
 
   /** Create a server error from a Quack error response. */
-  constructor(serverMessage: string) {
-    super(serverMessage);
+  constructor(serverMessage: string, details: QuackServerErrorDetails = {}) {
+    super(details.exceptionType ? `${details.exceptionType} Error: ${serverMessage}` : serverMessage);
     this.name = "QuackServerError";
     this.serverMessage = serverMessage;
+    this.exceptionType = details.exceptionType;
+    this.extraInfo = details.extraInfo ?? {};
+    this.mustInvalidate = details.mustInvalidate ?? false;
   }
 }
 

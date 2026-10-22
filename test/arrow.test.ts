@@ -173,4 +173,24 @@ describe("Arrow conversion helpers", () => {
 
     expect(() => dataChunksFromArrowTable(unsupported)).toThrow(QuackUnsupportedTypeError);
   });
+
+  it("maps DuckDB 2.0 TUPLE and TIMESTAMPTZ_NS columns and tags geometries for GeoJSON", () => {
+    const wkbPoint = new Uint8Array([1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xf0, 0x3f, 0, 0, 0, 0, 0, 0, 0, 0x40]);
+    const chunk = dataChunk([
+      column(LogicalTypes.tuple([LogicalTypes.integer(), LogicalTypes.varchar()]), [[1, "a"], null], "t"),
+      column(LogicalTypes.timestampTzNanos(), [{ kind: "timestamp", unit: "nanos", value: 5n, timezone: "utc" }, null], "ts"),
+      column(LogicalTypes.geometry(), [wkbPoint, null], "geom")
+    ]);
+    const table = arrowTableFromDataChunk(chunk, chunk.columnNames, { useBigIntTimestamp: true, useGeoJSON: true });
+    expect(table.at(0)).toEqual({ t: { 0: 1, 1: "a" }, ts: 5n, geom: { type: "Point", coordinates: [1, 2] } });
+    expect(table.schema.fields[2]?.metadata?.get("ARROW:extension:name")).toBe("geoarrow.wkb");
+
+    const [roundTrip] = dataChunksFromArrowTable(arrowTableFromDataChunk(chunk, chunk.columnNames, { useBigIntTimestamp: true }));
+    expect(roundTrip?.types.map((type) => type.id)).toEqual([LogicalTypeId.TUPLE, LogicalTypeId.TIMESTAMP_TZ_NS, LogicalTypeId.GEOMETRY]);
+    expect(roundTrip?.columns.map((vector) => vector.values[0])).toEqual([
+      [1, "a"],
+      { kind: "timestamp", unit: "nanos", value: 5n, timezone: "utc" },
+      wkbPoint
+    ]);
+  });
 });

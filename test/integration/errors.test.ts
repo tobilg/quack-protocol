@@ -41,7 +41,8 @@ describe.skipIf(!integrationUrl)("Quack error handling", () => {
           type: MessageType.PREPARE_REQUEST,
           connectionId: "definitely_not_a_connection",
           clientQueryId: 202n,
-          sql: "SELECT 1"
+          sql: "SELECT 1",
+          queryUuid: { upper: 0n, lower: 1n }
         })
       ).rejects.toThrow(QuackServerError);
     });

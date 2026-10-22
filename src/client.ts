@@ -1,5 +1,14 @@
-import { DEFAULT_QUACK_PORT, DUCKDB_MIME_TYPE, QUACK_ENDPOINT, QUACK_VERSION } from "./constants";
+import {
+  DEFAULT_HEARTBEAT_TIMEOUT_SECONDS,
+  DEFAULT_QUACK_PORT,
+  DUCKDB_MIME_TYPE,
+  MAX_HEARTBEAT_TIMEOUT_SECONDS,
+  QUACK_ENDPOINT,
+  QUACK_VERSION,
+  STANDARD_VECTOR_SIZE
+} from "./constants";
 import { QuackProtocolError, QuackServerError } from "./errors";
+import type { HugeIntParts } from "./binary";
 import type { LogicalType } from "./logical-types";
 import {
   decodeMessage,
@@ -11,7 +20,7 @@ import { dataChunkFromRows } from "./builders";
 import type { ColumnSchema } from "./builders";
 import { toJsonRows } from "./json";
 import type { QuackJsonOptions, QuackJsonRow } from "./json";
-import { formatSql } from "./sql";
+import { formatSql, logicalTypeToSql, quoteIdentifier, sqlLiteral } from "./sql";
 import type { SqlParameters } from "./sql";
 import { chunksToRows } from "./vector";
 import type { QuackDataChunk, QuackRow, QuackValue } from "./vector";
@@ -23,6 +32,11 @@ import {
 } from "./arrow";
 import type { QuackArrowAppendOptions, QuackArrowInput, QuackArrowIPCOptions, QuackArrowTableOptions } from "./arrow";
 import type { Table as ArrowTable } from "@uwdata/flechette";
+
+/** Rows sent per SEND_DATA batch by append helpers. */
+const APPEND_BATCH_ROWS = STANDARD_VECTOR_SIZE * 16;
+/** Timeout for best-effort cleanup requests such as cancel after a failed statement. */
+const CLEANUP_TIMEOUT_MS = 5_000;
 
 /** Options that apply to an individual Quack HTTP request. */
 export interface QuackRequestOptions {
@@ -44,11 +58,31 @@ export interface QuackClientOptions extends QuackRequestOptions {
   minSupportedQuackVersion?: number | bigint;
   /** Maximum Quack protocol version supported by the client. */
   maxSupportedQuackVersion?: number | bigint;
+  /** Optional stable client identifier sent to the server; at least 4 characters when set. */
+  clientId?: string;
+  /** Heartbeat lease timeout in seconds requested from the server. Defaults to 60. */
+  heartbeatTimeoutSeconds?: number;
+  /**
+   * Send heartbeat requests while the connection is idle so the server keeps
+   * the lease alive. Defaults to `true`.
+   */
+  heartbeat?: boolean;
+  /**
+   * Send an acknowledgement after each fully received result, releasing the
+   * server's reconnect cache (only used when the server enables
+   * `quack_enable_reconnects`). Defaults to `false`.
+   */
+  acknowledgeResults?: boolean;
   /** Custom fetch implementation, useful for tests or non-standard runtimes. */
   fetch?: typeof fetch;
   /** Extra HTTP headers merged into every Quack request. */
   headers?: HeadersInit;
-  /** Force non-HTTP connection strings to resolve to HTTPS. */
+  /**
+   * Transport for `quack:` and bare-host connection strings: `true` forces
+   * HTTPS, `false` forces HTTP. By default, like DuckDB, the client uses HTTP
+   * for `localhost`, `127.0.0.1`, and `::1`, and HTTPS for every other host.
+   * Ignored for `http://` and `https://` URLs.
+   */
   ssl?: boolean;
 }
 
@@ -56,6 +90,8 @@ export interface QuackClientOptions extends QuackRequestOptions {
 export interface QuackQueryOptions extends QuackRequestOptions {
   /** Positional or named SQL parameters formatted as client-side literals. */
   params?: SqlParameters;
+  /** Maximum rows the prepare response may carry inline. Unset uses the server setting. */
+  inlineRows?: number;
 }
 
 /** Options accepted by low-level append calls. */
@@ -68,7 +104,7 @@ export interface AppendOptions extends QuackRequestOptions {
 export interface AppendRowsOptions<T extends Record<string, unknown>> extends AppendOptions {
   /** Column definitions used to encode row values as a DuckDB DataChunk. */
   columns?: ColumnSchema<T>;
-  /** Number of input rows encoded into each append chunk. Defaults to all rows. */
+  /** Number of input rows encoded into each DataChunk. Defaults to all rows. */
   batchSize?: number;
 }
 
@@ -78,6 +114,8 @@ export interface TableReference {
   table: string;
   /** Optional schema name. */
   schema?: string;
+  /** Optional catalog (database) name. */
+  catalog?: string;
 }
 
 /** Parsed connection string with the HTTP base URL used for transport. */
@@ -100,6 +138,8 @@ export interface QuackConnectionInfo {
   serverPlatform?: string;
   /** Quack protocol version reported by the server. */
   quackVersion?: bigint;
+  /** Heartbeat lease timeout in seconds accepted by the server. */
+  heartbeatTimeoutSeconds?: number;
 }
 
 /** Result of a collected Quack query. */
@@ -127,7 +167,20 @@ export interface AppendArrowOptions extends AppendOptions, QuackArrowAppendOptio
 
 type NormalizedArrowQueryOptions = Omit<QuackArrowQueryIPCOptions, "params"> & { params: SqlParameters | undefined };
 
-/** Client for DuckDB's Quack HTTP protocol. */
+interface ActiveStatement {
+  generation: number;
+  queryUuid: HugeIntParts;
+}
+
+/**
+ * Client for DuckDB's Quack HTTP protocol.
+ *
+ * A Quack connection runs one statement at a time; the server cancels a
+ * running statement when the next one starts. The client therefore queues
+ * statements issued concurrently on the same instance. Streams release the
+ * queue between batches, so a statement started while a stream is not yet
+ * drained interrupts that stream. Use separate clients for concurrent work.
+ */
 export class QuackClient {
   /** HTTP or HTTPS base URL used for Quack requests. */
   readonly baseUrl: string;
@@ -136,14 +189,25 @@ export class QuackClient {
   /** Server metadata populated after a successful connection. */
   info: QuackConnectionInfo | undefined;
   private readonly headers: HeadersInit | undefined;
+  private readonly heartbeatEnabled: boolean;
+  private readonly acknowledgeResults: boolean;
   private connectionId: string | undefined;
   private closed = false;
+  private invalidatedReason: string | undefined;
   private nextQueryId = 1n;
+  private heartbeatTimeoutSeconds = DEFAULT_HEARTBEAT_TIMEOUT_SECONDS;
+  private heartbeatTimer: ReturnType<typeof setTimeout> | undefined;
+  private lastRequestAt = 0;
+  private statementTail: Promise<void> = Promise.resolve();
+  private statementGeneration = 0;
+  private activeStatement: ActiveStatement | undefined;
 
   private constructor(baseUrl: string, options: QuackClientOptions = {}) {
     this.baseUrl = baseUrl.replace(/\/$/, "");
     this.fetchImpl = options.fetch ?? globalThis.fetch;
     this.headers = options.headers;
+    this.heartbeatEnabled = options.heartbeat ?? true;
+    this.acknowledgeResults = options.acknowledgeResults ?? false;
     if (!this.fetchImpl) {
       throw new QuackProtocolError("No fetch implementation is available");
     }
@@ -157,18 +221,26 @@ export class QuackClient {
    */
   static async connect(uri: string, options: QuackClientOptions = {}): Promise<QuackClient> {
     const parsed = parseQuackUri(uri, options.ssl);
+    const heartbeatTimeoutSeconds = validateHeartbeatTimeout(options.heartbeatTimeoutSeconds ?? DEFAULT_HEARTBEAT_TIMEOUT_SECONDS);
+    if (options.clientId !== undefined && options.clientId !== "" && options.clientId.length < 4) {
+      throw new QuackProtocolError("clientId must be at least 4 characters long");
+    }
     const client = new QuackClient(parsed.baseUrl, options);
     const request: ConnectionRequestMessage = {
       type: MessageType.CONNECTION_REQUEST,
       clientPlatform: options.clientPlatform ?? defaultClientPlatform(),
       minSupportedQuackVersion: options.minSupportedQuackVersion ?? QUACK_VERSION,
-      maxSupportedQuackVersion: options.maxSupportedQuackVersion ?? QUACK_VERSION
+      maxSupportedQuackVersion: options.maxSupportedQuackVersion ?? QUACK_VERSION,
+      heartbeatTimeoutSeconds
     };
     if (options.authToken !== undefined) {
       request.authString = options.authToken;
     }
     if (options.clientDuckdbVersion !== undefined) {
       request.clientDuckdbVersion = options.clientDuckdbVersion;
+    }
+    if (options.clientId !== undefined) {
+      request.clientId = options.clientId;
     }
     const response = await client.send(request, options);
     if (response.type !== MessageType.CONNECTION_RESPONSE) {
@@ -178,11 +250,24 @@ export class QuackClient {
       throw new QuackProtocolError("CONNECTION_RESPONSE did not include a connection id");
     }
     client.connectionId = response.connectionId;
+    if (response.quackVersion !== BigInt(QUACK_VERSION)) {
+      await client.disconnect().catch(() => undefined);
+      throw new QuackProtocolError(
+        `Incompatible Quack protocol version: server uses ${response.quackVersion ?? "unknown"}, client supports ${QUACK_VERSION}`
+      );
+    }
+    if (response.heartbeatTimeoutSeconds !== undefined && response.heartbeatTimeoutSeconds > 0n) {
+      client.heartbeatTimeoutSeconds = validateHeartbeatTimeout(response.heartbeatTimeoutSeconds);
+    } else {
+      client.heartbeatTimeoutSeconds = heartbeatTimeoutSeconds;
+    }
     client.info = {
       ...(response.serverDuckdbVersion === undefined ? {} : { serverDuckdbVersion: response.serverDuckdbVersion }),
       ...(response.serverPlatform === undefined ? {} : { serverPlatform: response.serverPlatform }),
-      ...(response.quackVersion === undefined ? {} : { quackVersion: response.quackVersion })
+      ...(response.quackVersion === undefined ? {} : { quackVersion: response.quackVersion }),
+      heartbeatTimeoutSeconds: client.heartbeatTimeoutSeconds
     };
+    client.scheduleHeartbeat();
     return client;
   }
 
@@ -218,7 +303,7 @@ export class QuackClient {
 
   /** Whether this client currently has an open Quack connection. */
   get isConnected(): boolean {
-    return !!this.connectionId && !this.closed;
+    return !!this.connectionId && !this.closed && this.invalidatedReason === undefined;
   }
 
   /**
@@ -239,15 +324,22 @@ export class QuackClient {
     requestOptions?: QuackRequestOptions
   ): Promise<QuackQueryResult<T>> {
     const options = normalizeQueryOptions(paramsOrOptions, requestOptions);
-    const prepare = await this.prepare(formatSql(sql, options.params), options);
-    const chunks = attachColumnNames([...prepare.results], prepare.resultNames);
-    while (prepare.needsMoreFetch) {
-      const fetchResponse = await this.fetchResult(prepare.resultUuid, options);
-      if (fetchResponse.results.length === 0) {
-        break;
+    const formatted = formatSql(sql, options.params);
+    const { prepare, chunks } = await this.withStatement(async (statement) => {
+      const prepare = await this.prepare(formatted, statement, options);
+      const chunks = attachColumnNames(prepare.results, prepare.resultNames);
+      if (prepare.needsMoreFetch) {
+        for (let batchIndex = 1; ; batchIndex++) {
+          const response = await this.fetchBatch(statement, batchIndex, options);
+          if (response.results.length === 0) {
+            break;
+          }
+          chunks.push(...attachColumnNames(response.results, prepare.resultNames));
+        }
       }
-      chunks.push(...attachColumnNames(fetchResponse.results, prepare.resultNames));
-    }
+      await this.acknowledge(statement);
+      return { prepare, chunks };
+    });
     return {
       names: prepare.resultNames,
       types: prepare.resultTypes,
@@ -346,7 +438,13 @@ export class QuackClient {
     return result.rows().map((row) => row[firstName] as T);
   }
 
-  /** Run SQL and stream decoded DuckDB DataChunks without materializing all rows. */
+  /**
+   * Run SQL and stream decoded DuckDB DataChunks without materializing all rows.
+   *
+   * Breaking out of the loop cancels the remaining result on the server. A
+   * statement started on this client before the stream is drained interrupts
+   * the stream.
+   */
   stream(sql: string, options?: QuackQueryOptions): AsyncGenerator<QuackDataChunk, void, void>;
   stream(sql: string, params: SqlParameters, options?: QuackRequestOptions): AsyncGenerator<QuackDataChunk, void, void>;
   async *stream(
@@ -355,18 +453,39 @@ export class QuackClient {
     requestOptions?: QuackRequestOptions
   ): AsyncGenerator<QuackDataChunk, void, void> {
     const options = normalizeQueryOptions(paramsOrOptions, requestOptions);
-    const prepare = await this.prepare(formatSql(sql, options.params), options);
-    for (const chunk of attachColumnNames(prepare.results, prepare.resultNames)) {
-      yield chunk;
-    }
-    while (prepare.needsMoreFetch) {
-      const fetchResponse = await this.fetchResult(prepare.resultUuid, options);
-      if (fetchResponse.results.length === 0) {
-        break;
-      }
-      for (const chunk of attachColumnNames(fetchResponse.results, prepare.resultNames)) {
+    const formatted = formatSql(sql, options.params);
+    let statement: ActiveStatement | undefined;
+    const prepare = await this.withStatement(async (active) => {
+      statement = active;
+      return this.prepare(formatted, active, options);
+    }, { keepActive: true });
+    const current = statement!;
+    let drained = !prepare.needsMoreFetch;
+    try {
+      for (const chunk of attachColumnNames(prepare.results, prepare.resultNames)) {
         yield chunk;
       }
+      for (let batchIndex = 1; !drained; batchIndex++) {
+        const response = await this.withStatementSlot(async () => {
+          if (this.statementGeneration !== current.generation) {
+            throw new QuackProtocolError("Stream was interrupted by another statement on the same Quack client");
+          }
+          return this.fetchBatch(current, batchIndex, options);
+        });
+        if (response.results.length === 0) {
+          drained = true;
+          break;
+        }
+        for (const chunk of attachColumnNames(response.results, prepare.resultNames)) {
+          yield chunk;
+        }
+      }
+      await this.acknowledge(current);
+    } finally {
+      if (!drained && this.statementGeneration === current.generation) {
+        await this.cancelQuietly(current);
+      }
+      this.endStatement(current);
     }
   }
 
@@ -403,40 +522,72 @@ export class QuackClient {
     }
   }
 
-  /** Append an already encoded DuckDB DataChunk to a table. */
-  async append(table: string, chunk: QuackDataChunk, schemaName?: string): Promise<void>;
-  async append(table: string, chunk: QuackDataChunk, options?: AppendOptions): Promise<void>;
-  async append(table: TableReference, chunk: QuackDataChunk, options?: QuackRequestOptions): Promise<void>;
+  /**
+   * Append one or more encoded DuckDB DataChunks to a table and return the number of inserted rows.
+   *
+   * All chunks are inserted by one `INSERT` statement, so they succeed or fail
+   * together. Columns are matched by position against the target table.
+   */
+  async append(table: string, data: QuackDataChunk | readonly QuackDataChunk[], schemaName?: string): Promise<number>;
+  async append(table: string, data: QuackDataChunk | readonly QuackDataChunk[], options?: AppendOptions): Promise<number>;
+  async append(table: TableReference, data: QuackDataChunk | readonly QuackDataChunk[], options?: QuackRequestOptions): Promise<number>;
   async append(
     table: string | TableReference,
-    chunk: QuackDataChunk,
+    data: QuackDataChunk | readonly QuackDataChunk[],
     schemaOrOptions?: string | AppendOptions | QuackRequestOptions
-  ): Promise<void>;
+  ): Promise<number>;
   async append(
     table: string | TableReference,
-    chunk: QuackDataChunk,
+    data: QuackDataChunk | readonly QuackDataChunk[],
     schemaOrOptions?: string | AppendOptions | QuackRequestOptions
-  ): Promise<void> {
+  ): Promise<number> {
     this.ensureOpen();
-    const { tableName, schemaName, options } = normalizeAppendArgs(table, schemaOrOptions);
-    const message: QuackMessage = {
-      type: MessageType.APPEND_REQUEST,
-      connectionId: this.getConnectionId(),
-      clientQueryId: this.allocateQueryId(),
-      tableName,
-      appendChunk: chunk
-    };
-    if (schemaName !== undefined) {
-      message.schemaName = schemaName;
+    const { target, options } = normalizeAppendArgs(table, schemaOrOptions);
+    const chunks: readonly QuackDataChunk[] = isChunkArray(data) ? data : [data];
+    const types = chunks[0]?.types;
+    if (!types || types.length === 0) {
+      throw new QuackProtocolError("append requires at least one chunk with at least one column");
     }
-    const response = await this.send(message, options);
-    if (response.type !== MessageType.SUCCESS_RESPONSE) {
-      throw new QuackProtocolError(`Expected SUCCESS_RESPONSE, got ${MessageType[response.type] ?? response.type}`);
+    for (const chunk of chunks) {
+      if (chunk.types.length !== types.length || chunk.types.some((type, index) => type.id !== types[index]?.id)) {
+        throw new QuackProtocolError("All append chunks must have the same column types");
+      }
     }
+    const batches = appendBatches(chunks);
+    const streamId = randomStreamId();
+    const prototype = `NULL::STRUCT(${types.map((type, index) => `col${index} ${logicalTypeToSql(type)}`).join(", ")})`;
+    const sql = `INSERT INTO ${target} SELECT * FROM scan_data_from_quack_client(${sqlLiteral(streamId)}, ${prototype}, ordered := true)`;
+
+    return this.withStatement(async (statement) => {
+      // inline_rows = 0: the statement waits for client data, so PREPARE must answer before any row exists
+      await this.prepare(sql, statement, { ...options, inlineRows: 0 });
+      for (let index = 0; index < batches.length; index++) {
+        await this.sendData({
+          type: MessageType.SEND_DATA_REQUEST,
+          connectionId: this.getConnectionId(),
+          clientQueryId: this.allocateQueryId(),
+          streamId,
+          chunks: batches[index]!,
+          batchIndex: index + 1
+        }, options);
+      }
+      await this.sendData({
+        type: MessageType.SEND_DATA_REQUEST,
+        connectionId: this.getConnectionId(),
+        clientQueryId: this.allocateQueryId(),
+        streamId,
+        chunks: [],
+        totalBatches: batches.length
+      }, options);
+      const response = await this.fetchBatch(statement, 1, options);
+      const count = response.results[0]?.columns[0]?.values[0];
+      return count === undefined || count === null ? 0 : Number(count);
+    }, { cancelOnServerError: true });
   }
 
   /**
-   * Encode row objects as one or more flat DataChunks and append them to a table.
+   * Encode row objects as flat DataChunks and append them to a table in one
+   * statement. Returns the number of inserted rows.
    *
    * Provide explicit column types for stable production use, especially for
    * empty row sets or columns containing only `null`.
@@ -445,31 +596,29 @@ export class QuackClient {
     table: string | TableReference,
     rows: readonly T[],
     options: AppendRowsOptions<T> = {}
-  ): Promise<void> {
+  ): Promise<number> {
     const chunkOptions = options.columns === undefined ? {} : { columns: options.columns };
     if (rows.length === 0) {
-      await this.append(table, dataChunkFromRows(rows, chunkOptions), options);
-      return;
+      return this.append(table, dataChunkFromRows(rows, chunkOptions), options);
     }
     const batchSize = options.batchSize ?? rows.length;
     if (batchSize < 1) {
       throw new QuackProtocolError("appendRows batchSize must be at least 1");
     }
+    const chunks: QuackDataChunk[] = [];
     for (let offset = 0; offset < rows.length; offset += batchSize) {
-      const batch = rows.slice(offset, offset + batchSize);
-      await this.append(table, dataChunkFromRows(batch, chunkOptions), options);
+      chunks.push(dataChunkFromRows(rows.slice(offset, offset + batchSize), chunkOptions));
     }
+    return this.append(table, chunks, options);
   }
 
-  /** Append data from a Flechette Arrow Table or Arrow IPC bytes. */
+  /** Append data from a Flechette Arrow Table or Arrow IPC bytes. Returns the number of inserted rows. */
   async appendArrow(
     table: string | TableReference,
     input: QuackArrowInput,
     options: AppendArrowOptions = {}
-  ): Promise<void> {
-    for (const chunk of dataChunksFromArrow(input, options)) {
-      await this.append(table, chunk, options);
-    }
+  ): Promise<number> {
+    return this.append(table, dataChunksFromArrow(input, options), options);
   }
 
   /**
@@ -493,22 +642,56 @@ export class QuackClient {
     }
   }
 
+  /**
+   * Cancel the statement currently running on this client.
+   *
+   * Resolves to `false` when no statement is running.
+   */
+  async cancel(options: QuackRequestOptions = {}): Promise<boolean> {
+    const statement = this.activeStatement;
+    if (!statement || !this.isConnected) {
+      return false;
+    }
+    const response = await this.send({
+      type: MessageType.CANCEL_REQUEST,
+      connectionId: this.getConnectionId(),
+      clientQueryId: this.allocateQueryId(),
+      queryUuid: statement.queryUuid
+    }, options);
+    expectResponse(response, MessageType.SUCCESS_RESPONSE);
+    return true;
+  }
+
+  /** Send a heartbeat request, renewing the connection lease. */
+  async heartbeat(options: QuackRequestOptions = {}): Promise<void> {
+    this.ensureOpen();
+    const response = await this.send({
+      type: MessageType.HEARTBEAT_REQUEST,
+      connectionId: this.getConnectionId(),
+      clientQueryId: this.allocateQueryId()
+    }, options);
+    expectResponse(response, MessageType.SUCCESS_RESPONSE);
+  }
+
   /** Disconnect from the Quack server. Safe to call more than once. */
   async disconnect(options: QuackRequestOptions = {}): Promise<void> {
-    if (this.closed || !this.connectionId) {
+    this.stopHeartbeat();
+    const connectionId = this.connectionId;
+    if (this.closed || !connectionId) {
       this.closed = true;
+      return;
+    }
+    this.closed = true;
+    this.connectionId = undefined;
+    if (this.invalidatedReason !== undefined) {
       return;
     }
     const response = await this.send({
       type: MessageType.DISCONNECT_MESSAGE,
-      connectionId: this.connectionId,
+      connectionId,
       clientQueryId: this.allocateQueryId()
     }, options);
-    if (response.type !== MessageType.SUCCESS_RESPONSE) {
-      throw new QuackProtocolError(`Expected SUCCESS_RESPONSE, got ${MessageType[response.type] ?? response.type}`);
-    }
-    this.closed = true;
-    this.connectionId = undefined;
+    expectResponse(response, MessageType.SUCCESS_RESPONSE);
   }
 
   /** Alias for {@link disconnect}. */
@@ -528,6 +711,8 @@ export class QuackClient {
     new Uint8Array(body).set(bytes);
     const { signal, cleanup } = composeRequestSignal(options);
     let response: Response;
+    let responseBytes: Uint8Array;
+    this.lastRequestAt = Date.now();
     try {
       const init: RequestInit = {
         method: "POST",
@@ -542,52 +727,210 @@ export class QuackClient {
         init.signal = signal;
       }
       response = await this.fetchImpl(`${this.baseUrl}${QUACK_ENDPOINT}`, init);
+      if (!response.ok) {
+        throw new QuackProtocolError(`Quack HTTP request failed with ${response.status} ${response.statusText}`);
+      }
+      responseBytes = new Uint8Array(await response.arrayBuffer());
     } finally {
       cleanup();
     }
-    if (!response.ok) {
-      throw new QuackProtocolError(`Quack HTTP request failed with ${response.status} ${response.statusText}`);
-    }
-    const responseBytes = new Uint8Array(await response.arrayBuffer());
     const decoded = decodeMessage(responseBytes);
     if (decoded.type === MessageType.ERROR_RESPONSE) {
-      throw new QuackServerError(decoded.message);
+      if (decoded.mustInvalidate) {
+        this.invalidatedReason = decoded.message;
+        this.stopHeartbeat();
+      }
+      throw new QuackServerError(decoded.message, {
+        ...(decoded.exceptionType === undefined ? {} : { exceptionType: decoded.exceptionType }),
+        ...(decoded.extraInfo === undefined ? {} : { extraInfo: decoded.extraInfo }),
+        ...(decoded.mustInvalidate === undefined ? {} : { mustInvalidate: decoded.mustInvalidate })
+      });
     }
     return decoded;
   }
 
-  private async prepare(sql: string, options: QuackRequestOptions = {}): Promise<PrepareResponseMessage> {
-    this.ensureOpen();
+  private async prepare(
+    sql: string,
+    statement: ActiveStatement,
+    options: QuackQueryOptions = {}
+  ): Promise<PrepareResponseMessage> {
     const response = await this.send({
       type: MessageType.PREPARE_REQUEST,
       connectionId: this.getConnectionId(),
       clientQueryId: this.allocateQueryId(),
-      sql
+      sql,
+      queryUuid: statement.queryUuid,
+      ...(options.inlineRows === undefined ? {} : { inlineRows: options.inlineRows })
     }, options);
-    if (response.type !== MessageType.PREPARE_RESPONSE) {
-      throw new QuackProtocolError(`Expected PREPARE_RESPONSE, got ${MessageType[response.type] ?? response.type}`);
+    return expectResponse(response, MessageType.PREPARE_RESPONSE);
+  }
+
+  private async fetchBatch(
+    statement: ActiveStatement,
+    batchIndex: number,
+    options: QuackRequestOptions = {}
+  ): Promise<FetchResponseMessage> {
+    const response = expectResponse(
+      await this.send({
+        type: MessageType.FETCH_REQUEST,
+        connectionId: this.getConnectionId(),
+        clientQueryId: this.allocateQueryId(),
+        queryUuid: statement.queryUuid,
+        batchIndex,
+        ackIndex: batchIndex - 1
+      }, options),
+      MessageType.FETCH_RESPONSE
+    );
+    if (response.results.length === 0) {
+      const received = BigInt(batchIndex - 1);
+      if (response.totalBatches !== undefined && response.totalBatches !== received) {
+        throw new QuackProtocolError(`Result ended after ${received} batches but the server announced ${response.totalBatches}`);
+      }
+    } else if (response.batchIndex !== BigInt(batchIndex)) {
+      throw new QuackProtocolError(`FETCH_RESPONSE carries batch ${response.batchIndex ?? "none"} but batch ${batchIndex} was requested`);
     }
     return response;
   }
 
-  private async fetchResult(
-    resultUuid: PrepareResponseMessage["resultUuid"],
-    options: QuackRequestOptions = {}
-  ): Promise<FetchResponseMessage> {
-    this.ensureOpen();
-    const response = await this.send({
-      type: MessageType.FETCH_REQUEST,
-      connectionId: this.getConnectionId(),
-      clientQueryId: this.allocateQueryId(),
-      resultUuid
-    }, options);
-    if (response.type !== MessageType.FETCH_RESPONSE) {
-      throw new QuackProtocolError(`Expected FETCH_RESPONSE, got ${MessageType[response.type] ?? response.type}`);
+  private async sendData(message: QuackMessage, options: QuackRequestOptions): Promise<void> {
+    expectResponse(await this.send(message, options), MessageType.SEND_DATA_RESPONSE);
+  }
+
+  private async acknowledge(statement: ActiveStatement): Promise<void> {
+    if (!this.acknowledgeResults || !this.isConnected) {
+      return;
     }
-    return response;
+    try {
+      await this.send({
+        type: MessageType.ACKNOWLEDGEMENT,
+        connectionId: this.getConnectionId(),
+        clientQueryId: this.allocateQueryId(),
+        queryUuid: statement.queryUuid
+      }, { timeoutMs: CLEANUP_TIMEOUT_MS });
+    } catch {
+      // The result is complete; a failed acknowledgement only delays cache release.
+    }
+  }
+
+  /** Best-effort cancel of a statement that failed or was abandoned client-side. */
+  private async cancelQuietly(statement: ActiveStatement): Promise<void> {
+    if (!this.isConnected) {
+      return;
+    }
+    try {
+      await this.send({
+        type: MessageType.CANCEL_REQUEST,
+        connectionId: this.getConnectionId(),
+        clientQueryId: this.allocateQueryId(),
+        queryUuid: statement.queryUuid
+      }, { timeoutMs: CLEANUP_TIMEOUT_MS });
+    } catch {
+      // The next statement supersedes the abandoned one anyway.
+    }
+  }
+
+  /**
+   * Run a statement while holding the connection's statement slot.
+   *
+   * Failures other than server errors (aborts, timeouts, transport errors)
+   * cancel the statement on the server before the slot is released. A server
+   * error already ends a query, but not a statement waiting for client data.
+   */
+  private async withStatement<T>(
+    fn: (statement: ActiveStatement) => Promise<T>,
+    { keepActive = false, cancelOnServerError = false }: { keepActive?: boolean; cancelOnServerError?: boolean } = {}
+  ): Promise<T> {
+    return this.withStatementSlot(async () => {
+      this.ensureOpen();
+      const statement = this.beginStatement();
+      let succeeded = false;
+      try {
+        const result = await fn(statement);
+        succeeded = true;
+        return result;
+      } catch (error) {
+        if (cancelOnServerError || !(error instanceof QuackServerError)) {
+          await this.cancelQuietly(statement);
+        }
+        throw error;
+      } finally {
+        if (!succeeded || !keepActive) {
+          this.endStatement(statement);
+        }
+      }
+    });
+  }
+
+  private async withStatementSlot<T>(fn: () => Promise<T>): Promise<T> {
+    let release!: () => void;
+    const slot = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const previous = this.statementTail;
+    this.statementTail = previous.then(() => slot);
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+
+  private beginStatement(): ActiveStatement {
+    const statement = { generation: ++this.statementGeneration, queryUuid: randomQueryUuid() };
+    this.activeStatement = statement;
+    return statement;
+  }
+
+  private endStatement(statement: ActiveStatement): void {
+    if (this.activeStatement === statement) {
+      this.activeStatement = undefined;
+    }
+  }
+
+  private scheduleHeartbeat(): void {
+    if (!this.heartbeatEnabled || !this.isConnected) {
+      return;
+    }
+    // renew at about a third of the lease, with jitter, like DuckDB's own client
+    const intervalMs = (this.heartbeatTimeoutSeconds * 1000) / 3;
+    const delayMs = Math.min(intervalMs * (0.8 + Math.random() * 0.4), 0x7fff_ffff);
+    const timer = setTimeout(() => {
+      this.heartbeatTimer = undefined;
+      void this.heartbeatTick(intervalMs);
+    }, delayMs);
+    unrefTimer(timer);
+    this.heartbeatTimer = timer;
+  }
+
+  private async heartbeatTick(intervalMs: number): Promise<void> {
+    if (!this.isConnected) {
+      return;
+    }
+    // any request renews the lease, so skip the heartbeat while the client is busy
+    if (Date.now() - this.lastRequestAt >= intervalMs / 2) {
+      try {
+        await this.heartbeat({ timeoutMs: CLEANUP_TIMEOUT_MS });
+      } catch {
+        // A failed heartbeat is retried on the next interval.
+      }
+    }
+    this.scheduleHeartbeat();
+  }
+
+  private stopHeartbeat(): void {
+    if (this.heartbeatTimer !== undefined) {
+      clearTimeout(this.heartbeatTimer);
+      this.heartbeatTimer = undefined;
+    }
   }
 
   private ensureOpen(): void {
+    if (this.invalidatedReason !== undefined) {
+      throw new QuackProtocolError(
+        `The Quack server invalidated its database and must be restarted: ${this.invalidatedReason}`
+      );
+    }
     if (this.closed || !this.connectionId) {
       throw new QuackProtocolError("Quack client is not connected");
     }
@@ -595,10 +938,7 @@ export class QuackClient {
 
   private getConnectionId(): string {
     this.ensureOpen();
-    if (!this.connectionId) {
-      throw new QuackProtocolError("Quack client is not connected");
-    }
-    return this.connectionId;
+    return this.connectionId!;
   }
 
   private allocateQueryId(): bigint {
@@ -609,7 +949,8 @@ export class QuackClient {
 /**
  * Parse a Quack connection string into the HTTP base URL used by the client.
  *
- * Bare hosts default to port 9494, and `quack:` URIs are normalized to HTTP(S).
+ * Bare hosts default to port 9494, and `quack:` URIs are normalized to HTTP(S):
+ * HTTP for local hosts and HTTPS otherwise, unless `sslOverride` is given.
  */
 export function parseQuackUri(input: string, sslOverride?: boolean): ParsedQuackUri {
   const uri = input.trim();
@@ -638,7 +979,7 @@ export function parseQuackUri(input: string, sslOverride?: boolean): ParsedQuack
   }
 
   const { host, port } = parseHostPort(rest);
-  const ssl = sslOverride ?? false;
+  const ssl = sslOverride ?? !isLocalHost(host);
   const protocol = ssl ? "https" : "http";
   const bracketedHost = host.includes(":") && !host.startsWith("[") ? `[${host}]` : host;
   return {
@@ -647,6 +988,11 @@ export function parseQuackUri(input: string, sslOverride?: boolean): ParsedQuack
     port,
     ssl
   };
+}
+
+/** DuckDB's rule (`QuackUri::IsLocal`) for hosts served over plain HTTP by default. */
+function isLocalHost(host: string): boolean {
+  return host.toLowerCase() === "localhost" || host === "127.0.0.1" || host === "::1";
 }
 
 function parseHostPort(value: string): { host: string; port: number } {
@@ -688,8 +1034,104 @@ function defaultClientPlatform(): string {
   return navigatorLike?.userAgent ?? "quack-ts";
 }
 
+function validateHeartbeatTimeout(value: number | bigint): number {
+  const seconds = BigInt(value);
+  if (typeof value === "number" && !Number.isInteger(value)) {
+    throw new QuackProtocolError("heartbeatTimeoutSeconds must be an integer");
+  }
+  if (seconds < 1n || seconds > MAX_HEARTBEAT_TIMEOUT_SECONDS || seconds > BigInt(Number.MAX_SAFE_INTEGER)) {
+    throw new QuackProtocolError(`heartbeatTimeoutSeconds must be between 1 and ${Number.MAX_SAFE_INTEGER}`);
+  }
+  return Number(seconds);
+}
+
+function expectResponse<T extends MessageType>(
+  response: QuackMessage,
+  type: T
+): Extract<QuackMessage, { type: T }> {
+  if (response.type !== type) {
+    throw new QuackProtocolError(`Expected ${MessageType[type]}, got ${MessageType[response.type] ?? response.type}`);
+  }
+  return response as Extract<QuackMessage, { type: T }>;
+}
+
 function attachColumnNames(chunks: readonly QuackDataChunk[], names: readonly string[]): QuackDataChunk[] {
   return chunks.map((chunk) => ({ ...chunk, columnNames: [...names] }));
+}
+
+function isChunkArray(data: QuackDataChunk | readonly QuackDataChunk[]): data is readonly QuackDataChunk[] {
+  return Array.isArray(data);
+}
+
+/** Split chunks into SEND_DATA batches of at most {@link APPEND_BATCH_ROWS} rows, each chunk at most 2048 rows. */
+function appendBatches(chunks: readonly QuackDataChunk[]): QuackDataChunk[][] {
+  const batches: QuackDataChunk[][] = [];
+  let current: QuackDataChunk[] = [];
+  let currentRows = 0;
+  for (const chunk of chunks) {
+    for (let offset = 0; offset < chunk.rowCount; offset += STANDARD_VECTOR_SIZE) {
+      const slice = sliceChunk(chunk, offset, Math.min(chunk.rowCount, offset + STANDARD_VECTOR_SIZE));
+      if (currentRows + slice.rowCount > APPEND_BATCH_ROWS && current.length > 0) {
+        batches.push(current);
+        current = [];
+        currentRows = 0;
+      }
+      current.push(slice);
+      currentRows += slice.rowCount;
+    }
+  }
+  if (current.length > 0) {
+    batches.push(current);
+  }
+  return batches;
+}
+
+function sliceChunk(chunk: QuackDataChunk, start: number, end: number): QuackDataChunk {
+  if (start === 0 && end === chunk.rowCount) {
+    return chunk;
+  }
+  return {
+    ...chunk,
+    rowCount: end - start,
+    columns: chunk.columns.map((column) => ({ ...column, values: column.values.slice(start, end) }))
+  };
+}
+
+function randomBytes(length: number): Uint8Array {
+  const bytes = new Uint8Array(length);
+  const crypto = globalThis.crypto;
+  if (crypto?.getRandomValues) {
+    crypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < length; index++) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+  return bytes;
+}
+
+/** Generate a random, nonzero 128-bit query id. Zero is reserved for internal server traffic. */
+function randomQueryUuid(): HugeIntParts {
+  for (;;) {
+    const view = new DataView(randomBytes(16).buffer);
+    const upper = view.getBigInt64(0, true);
+    const lower = view.getBigUint64(8, true);
+    if (upper !== 0n || lower !== 0n) {
+      return { upper, lower };
+    }
+  }
+}
+
+function randomStreamId(): string {
+  return [...randomBytes(16)].map((byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+/** Let Node exit while only the heartbeat timer is pending; browsers return plain timer ids. */
+function unrefTimer(timer: ReturnType<typeof setTimeout>): void {
+  const handle = timer as unknown as { unref?: () => void } | number;
+  if (typeof handle === "object" && typeof handle.unref === "function") {
+    handle.unref();
+  }
 }
 
 function normalizeQueryOptions(
@@ -734,6 +1176,7 @@ function isArrowQueryOptions(value: object): value is QuackArrowQueryOptions | Q
     "useBigIntTimestamp" in value ||
     "useMap" in value ||
     "useProxy" in value ||
+    "useGeoJSON" in value ||
     "duckTypes" in value ||
     "format" in value ||
     "codec" in value
@@ -741,28 +1184,26 @@ function isArrowQueryOptions(value: object): value is QuackArrowQueryOptions | Q
 }
 
 function isQueryOptions(value: object): value is QuackQueryOptions {
-  return "params" in value || "signal" in value || "timeoutMs" in value;
+  return "params" in value || "signal" in value || "timeoutMs" in value || "inlineRows" in value;
 }
 
 function normalizeAppendArgs(
   table: string | TableReference,
   schemaOrOptions: string | AppendOptions | QuackRequestOptions | undefined
-): { tableName: string; schemaName?: string; options: QuackRequestOptions } {
-  const tableRef = typeof table === "string" ? { table } : table;
-  const baseSchema = tableRef.schema;
-  if (typeof schemaOrOptions === "string") {
-    return {
-      tableName: tableRef.table,
-      schemaName: schemaOrOptions,
-      options: {}
-    };
+): { target: string; options: QuackRequestOptions } {
+  const tableRef: TableReference = typeof table === "string" ? { table } : table;
+  const options = typeof schemaOrOptions === "string" ? {} : schemaOrOptions ?? {};
+  const schemaName = typeof schemaOrOptions === "string" ? schemaOrOptions : (options as AppendOptions).schema ?? tableRef.schema;
+  if (!tableRef.table) {
+    throw new QuackProtocolError("append requires a table name");
   }
-  const options = schemaOrOptions ?? {};
-  const appendOptions = options as AppendOptions;
-  const schemaName = appendOptions.schema ?? baseSchema;
+  const parts = [
+    ...(tableRef.catalog === undefined ? [] : [tableRef.catalog]),
+    ...(schemaName === undefined ? [] : [schemaName]),
+    tableRef.table
+  ];
   return {
-    tableName: tableRef.table,
-    ...(schemaName === undefined ? {} : { schemaName }),
+    target: parts.map(quoteIdentifier).join("."),
     options: {
       ...(options.signal === undefined ? {} : { signal: options.signal }),
       ...(options.timeoutMs === undefined ? {} : { timeoutMs: options.timeoutMs })

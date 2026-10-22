@@ -8,6 +8,16 @@ import type {
   TimestampValue
 } from "./vector";
 import { decimalToString } from "./vector";
+import { QuackUnsupportedTypeError } from "./errors";
+import {
+  ExtraTypeInfoType,
+  getArraySize,
+  getChildType,
+  getEnumValues,
+  getStructChildren,
+  LogicalTypeId
+} from "./logical-types";
+import type { LogicalType } from "./logical-types";
 
 /** Scalar value accepted by the client-side SQL literal formatter. */
 export type SqlParameterValue = QuackValue | Date | undefined;
@@ -88,6 +98,94 @@ export function sqlLiteral(value: SqlParameter): string {
     throw new TypeError("Object SQL parameters are not supported; pass scalar values or arrays");
   }
   return String(value);
+}
+
+/** Quote a SQL identifier with double quotes, escaping embedded quotes. */
+export function quoteIdentifier(name: string): string {
+  return `"${name.replaceAll('"', '""')}"`;
+}
+
+/**
+ * Render a DuckDB logical type as SQL type text, for example `DECIMAL(10,2)` or
+ * `STRUCT("a" INTEGER, "b" VARCHAR[])`.
+ *
+ * Type aliases are ignored so the result does not depend on user-defined types
+ * being visible to the statement.
+ */
+export function logicalTypeToSql(type: LogicalType): string {
+  switch (type.id) {
+    case LogicalTypeId.SQLNULL:
+      return '"NULL"';
+    case LogicalTypeId.BOOLEAN:
+    case LogicalTypeId.TINYINT:
+    case LogicalTypeId.SMALLINT:
+    case LogicalTypeId.INTEGER:
+    case LogicalTypeId.BIGINT:
+    case LogicalTypeId.UTINYINT:
+    case LogicalTypeId.USMALLINT:
+    case LogicalTypeId.UINTEGER:
+    case LogicalTypeId.UBIGINT:
+    case LogicalTypeId.HUGEINT:
+    case LogicalTypeId.UHUGEINT:
+    case LogicalTypeId.FLOAT:
+    case LogicalTypeId.DOUBLE:
+    case LogicalTypeId.VARCHAR:
+    case LogicalTypeId.BLOB:
+    case LogicalTypeId.BIT:
+    case LogicalTypeId.BIGNUM:
+    case LogicalTypeId.UUID:
+    case LogicalTypeId.DATE:
+    case LogicalTypeId.TIME:
+    case LogicalTypeId.TIME_NS:
+    case LogicalTypeId.TIMESTAMP:
+    case LogicalTypeId.TIMESTAMP_MS:
+    case LogicalTypeId.TIMESTAMP_NS:
+    case LogicalTypeId.INTERVAL:
+    case LogicalTypeId.VARIANT:
+      return LogicalTypeId[type.id];
+    case LogicalTypeId.CHAR:
+      return "VARCHAR";
+    case LogicalTypeId.TIMESTAMP_SEC:
+      return "TIMESTAMP_S";
+    case LogicalTypeId.TIMESTAMP_TZ:
+      return "TIMESTAMP WITH TIME ZONE";
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
+      return "TIMESTAMPTZ_NS";
+    case LogicalTypeId.TIME_TZ:
+      return "TIME WITH TIME ZONE";
+    case LogicalTypeId.DECIMAL: {
+      const info = type.typeInfo;
+      if (info?.type !== ExtraTypeInfoType.DECIMAL) {
+        return "DECIMAL";
+      }
+      return `DECIMAL(${info.width},${info.scale})`;
+    }
+    case LogicalTypeId.ENUM:
+      return `ENUM(${getEnumValues(type).map((value) => sqlLiteral(value)).join(", ")})`;
+    case LogicalTypeId.LIST:
+      return `${logicalTypeToSql(getChildType(type))}[]`;
+    case LogicalTypeId.ARRAY:
+      return `${logicalTypeToSql(getChildType(type))}[${getArraySize(type)}]`;
+    case LogicalTypeId.MAP: {
+      const [key, value] = getStructChildren(getChildType(type));
+      if (!key || !value) {
+        throw new QuackUnsupportedTypeError("MAP type is missing key/value children");
+      }
+      return `MAP(${logicalTypeToSql(key.type)}, ${logicalTypeToSql(value.type)})`;
+    }
+    case LogicalTypeId.STRUCT:
+      return `STRUCT(${getStructChildren(type)
+        .map((child) => `${quoteIdentifier(child.name)} ${logicalTypeToSql(child.type)}`)
+        .join(", ")})`;
+    case LogicalTypeId.TUPLE:
+      return `TUPLE(${getStructChildren(type).map((child) => logicalTypeToSql(child.type)).join(", ")})`;
+    case LogicalTypeId.GEOMETRY: {
+      const definition = type.typeInfo?.type === ExtraTypeInfoType.GEO ? type.typeInfo.crs?.definition : undefined;
+      return definition ? `GEOMETRY(${sqlLiteral(definition)})` : "GEOMETRY";
+    }
+    default:
+      throw new QuackUnsupportedTypeError(`Cannot render DuckDB logical type ${LogicalTypeId[type.id] ?? type.id} as SQL`);
+  }
 }
 
 function formatPositionalSql(sql: string, params: PositionalSqlParameters): string {

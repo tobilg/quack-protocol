@@ -45,9 +45,8 @@ jobs:
           duckdb_dir="${RUNNER_TEMP}/duckdb"
           mkdir -p "${duckdb_dir}"
 
-          curl -fsSL "https://install.duckdb.org/v1.5.2/duckdb_cli-linux-amd64.zip" \
-            -o "${duckdb_dir}/duckdb_cli-linux-amd64.zip"
-          unzip -q "${duckdb_dir}/duckdb_cli-linux-amd64.zip" -d "${duckdb_dir}"
+          curl -fsSL "https://install.duckdb.org/v2.0.0/duckdb-cli-linux-amd64.tar.gz" \
+            | tar -xzf - -C "${duckdb_dir}"
           chmod +x "${duckdb_dir}/duckdb"
 
           echo "${duckdb_dir}" >> "${GITHUB_PATH}"

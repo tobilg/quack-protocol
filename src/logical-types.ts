@@ -58,6 +58,7 @@ export enum LogicalTypeId {
   UINTEGER = 30,
   UBIGINT = 31,
   TIMESTAMP_TZ = 32,
+  TIMESTAMP_TZ_NS = 33,
   TIME_TZ = 34,
   TIME_NS = 35,
   BIT = 36,
@@ -75,11 +76,14 @@ export enum LogicalTypeId {
   MAP = 102,
   TABLE = 103,
   ENUM = 104,
+  /** Legacy aggregate state; DuckDB 2.0 reads these as BLOB. */
   AGGREGATE_STATE = 105,
   LAMBDA = 106,
   UNION = 107,
   ARRAY = 108,
-  VARIANT = 109
+  VARIANT = 109,
+  /** Unnamed STRUCT; values are materialized as arrays. */
+  TUPLE = 110
 }
 
 /** DuckDB ExtraTypeInfo discriminator values. */
@@ -169,15 +173,15 @@ export interface EnumTypeInfo extends BaseExtraTypeInfo {
   values: string[];
 }
 
-/** AGGREGATE_STATE metadata. */
+/** Legacy AGGREGATE_STATE metadata. DuckDB 2.0 no longer serializes the function details. */
 export interface AggregateStateTypeInfo extends BaseExtraTypeInfo {
   type: ExtraTypeInfoType.AGGREGATE_STATE;
-  /** Aggregate function name. */
-  functionName: string;
-  /** Aggregate return type. */
-  returnType: LogicalType;
-  /** Bound argument types. */
-  boundArgumentTypes: LogicalType[];
+  /** Aggregate function name, when sent by older servers. */
+  functionName?: string;
+  /** Aggregate return type, when sent by older servers. */
+  returnType?: LogicalType;
+  /** Bound argument types, when sent by older servers. */
+  boundArgumentTypes?: LogicalType[];
 }
 
 /** ARRAY child type and fixed size metadata. */
@@ -313,6 +317,8 @@ export const LogicalTypes = {
   timestampNanos: () => logicalType(LogicalTypeId.TIMESTAMP_NS),
   /** TIMESTAMP WITH TIME ZONE logical type. */
   timestampTz: () => logicalType(LogicalTypeId.TIMESTAMP_TZ),
+  /** TIMESTAMP_NS WITH TIME ZONE logical type. */
+  timestampTzNanos: () => logicalType(LogicalTypeId.TIMESTAMP_TZ_NS),
   /** INTERVAL logical type. */
   interval: () => logicalType(LogicalTypeId.INTERVAL),
   /** DECIMAL logical type with width and scale metadata. */
@@ -335,6 +341,12 @@ export const LogicalTypes = {
   /** STRUCT logical type with named child fields. */
   struct: (childTypes: ChildType[]) =>
     logicalType(LogicalTypeId.STRUCT, { type: ExtraTypeInfoType.STRUCT, childTypes }),
+  /** TUPLE (unnamed STRUCT) logical type; values are arrays in child order. */
+  tuple: (childTypes: LogicalType[]) =>
+    logicalType(LogicalTypeId.TUPLE, {
+      type: ExtraTypeInfoType.STRUCT,
+      childTypes: childTypes.map((type): ChildType => ({ name: "", type }))
+    }),
   /** ARRAY logical type with child type and fixed size. */
   array: (childType: LogicalType, size: number) =>
     logicalType(LogicalTypeId.ARRAY, { type: ExtraTypeInfoType.ARRAY, childType, size }),
@@ -394,9 +406,6 @@ export function encodeExtraTypeInfo(writer: BinaryWriter, info: ExtraTypeInfo): 
         object.writeField(201, () => object.writeList(info.values, (value) => object.writeString(value)));
         break;
       case ExtraTypeInfoType.AGGREGATE_STATE:
-        object.writeField(200, () => object.writeString(info.functionName));
-        object.writeField(201, () => encodeLogicalType(object, info.returnType));
-        object.writeField(202, () => object.writeList(info.boundArgumentTypes, (type) => encodeLogicalType(object, type)));
         break;
       case ExtraTypeInfoType.ARRAY:
         object.writeField(200, () => encodeLogicalType(object, info.childType));
@@ -478,14 +487,18 @@ export function decodeExtraTypeInfo(reader: BinaryReader): ExtraTypeInfo {
         }
         return { ...base, type, values };
       }
-      case ExtraTypeInfoType.AGGREGATE_STATE:
+      case ExtraTypeInfoType.AGGREGATE_STATE: {
+        const functionName = object.readOptionalField(200, () => object.readString(), undefined);
+        const returnType = object.readOptionalField(201, () => decodeLogicalType(object), undefined);
+        const boundArgumentTypes = object.readOptionalField(202, () => object.readList(() => decodeLogicalType(object)), undefined);
         return {
           ...base,
           type,
-          functionName: object.readRequiredField(200, () => object.readString()),
-          returnType: object.readRequiredField(201, () => decodeLogicalType(object)),
-          boundArgumentTypes: object.readRequiredField(202, () => object.readList(() => decodeLogicalType(object)))
+          ...optionalProp("functionName", functionName),
+          ...optionalProp("returnType", returnType),
+          ...optionalProp("boundArgumentTypes", boundArgumentTypes)
         };
+      }
       case ExtraTypeInfoType.ARRAY:
         return {
           ...base,
@@ -565,6 +578,7 @@ export function getPhysicalType(type: LogicalType): PhysicalType {
     case LogicalTypeId.TIMESTAMP_MS:
     case LogicalTypeId.TIME_TZ:
     case LogicalTypeId.TIMESTAMP_TZ:
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
       return PhysicalType.INT64;
     case LogicalTypeId.UBIGINT:
       return PhysicalType.UINT64;
@@ -593,6 +607,7 @@ export function getPhysicalType(type: LogicalType): PhysicalType {
     case LogicalTypeId.UNION:
     case LogicalTypeId.VARIANT:
     case LogicalTypeId.STRUCT:
+    case LogicalTypeId.TUPLE:
       return PhysicalType.STRUCT;
     case LogicalTypeId.LIST:
     case LogicalTypeId.MAP:

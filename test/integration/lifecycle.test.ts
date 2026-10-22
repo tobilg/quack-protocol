@@ -60,7 +60,9 @@ describe.skipIf(!integrationUrl)("Quack connection lifecycle", () => {
         type: MessageType.PREPARE_REQUEST,
         connectionId: (client as unknown as { connectionId: string }).connectionId,
         clientQueryId: 100n,
-        sql: "SELECT * FROM range(10) t(i)"
+        sql: "SELECT * FROM range(10) t(i)",
+        queryUuid: { upper: 0n, lower: 4242n },
+        inlineRows: 0
       });
       expect(first.type).toBe(MessageType.PREPARE_RESPONSE);
 
@@ -74,7 +76,8 @@ describe.skipIf(!integrationUrl)("Quack connection lifecycle", () => {
           type: MessageType.FETCH_REQUEST,
           connectionId: (client as unknown as { connectionId: string }).connectionId,
           clientQueryId: 101n,
-          resultUuid: first.resultUuid
+          queryUuid: first.queryUuid,
+          batchIndex: 1
         })
       ).rejects.toThrow(QuackServerError);
     });

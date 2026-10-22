@@ -78,6 +78,7 @@ import type {
 
 const textEncoder = new TextEncoder();
 const QUACK_LOGICAL_TYPE_METADATA = "quack:logicalType";
+const ARROW_EXTENSION_NAME_METADATA = "ARROW:extension:name";
 const BIGINT_METADATA_KEY = "__quackBigInt";
 
 /** Flechette extraction options accepted by Quack Arrow helpers. */
@@ -153,7 +154,7 @@ export function arrowTableFromChunks(
       if (!columnData) {
         throw new QuackProtocolError(`Chunk is missing column ${columnIndex}`);
       }
-      return arrowBatchFromValues(field.type, type, columnData.values, arrowOptions);
+      return arrowBatchFromValues(field.type, type, columnData.values, arrowOptions, field.metadata);
     });
     return new Column(batches, field.type);
   });
@@ -242,11 +243,16 @@ export function dataChunksFromArrow(input: QuackArrowInput, options: QuackArrowA
 }
 
 function arrowFieldFromLogicalType(name: string, type: LogicalType): Field {
+  const metadata = new Map([[QUACK_LOGICAL_TYPE_METADATA, serializeLogicalType(type)]]);
+  if (type.id === LogicalTypeId.GEOMETRY) {
+    // DuckDB geometries are WKB; the GeoArrow tag lets Flechette's useGeoJSON decode them
+    metadata.set(ARROW_EXTENSION_NAME_METADATA, "geoarrow.wkb");
+  }
   return {
     name,
     type: arrowTypeFromLogicalType(type),
     nullable: true,
-    metadata: new Map([[QUACK_LOGICAL_TYPE_METADATA, serializeLogicalType(type)]])
+    metadata
   };
 }
 
@@ -311,6 +317,8 @@ function arrowTypeFromLogicalType(type: LogicalType): DataType {
       return timestamp(TimeUnit.NANOSECOND);
     case LogicalTypeId.TIMESTAMP_TZ:
       return timestamp(TimeUnit.MICROSECOND, "UTC");
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
+      return timestamp(TimeUnit.NANOSECOND, "UTC");
     case LogicalTypeId.INTERVAL:
       return interval(IntervalUnit.MONTH_DAY_NANO);
     case LogicalTypeId.LIST:
@@ -327,6 +335,9 @@ function arrowTypeFromLogicalType(type: LogicalType): DataType {
     }
     case LogicalTypeId.STRUCT:
       return struct(getStructChildren(type).map((child) => arrowFieldFromLogicalType(child.name, child.type)));
+    case LogicalTypeId.TUPLE:
+      // Arrow structs need field names; unnamed TUPLE members are named by position
+      return struct(getStructChildren(type).map((child, index) => arrowFieldFromLogicalType(String(index), child.type)));
     case LogicalTypeId.ARRAY:
       return fixedSizeList(arrowFieldFromLogicalType("item", getChildType(type)), getArraySize(type));
     default:
@@ -338,11 +349,12 @@ function arrowBatchFromValues(
   arrowType: DataType,
   duckType: LogicalType,
   values: readonly QuackValue[],
-  options: QuackArrowOptions
+  options: QuackArrowOptions,
+  metadata: Field["metadata"] | null = null
 ): Batch<unknown> {
   const length = values.length;
   const { validity, nullCount } = validityBitmap(values);
-  const BatchCtor = batchType(arrowType, options) as new (options: Record<string, unknown>) => Batch<unknown>;
+  const BatchCtor = batchType(arrowType, options, metadata) as new (options: Record<string, unknown>) => Batch<unknown>;
   const base = { length, nullCount, type: arrowType, validity };
 
   switch (arrowType.typeId) {
@@ -425,6 +437,7 @@ function integerLikeValue(value: QuackValue, duckType: LogicalType, arrowType: D
     case LogicalTypeId.TIMESTAMP_MS:
     case LogicalTypeId.TIMESTAMP_NS:
     case LogicalTypeId.TIMESTAMP_TZ:
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
       return BigInt((value as TimestampValue).value);
     default:
       return typeof value === "bigint" ? value : Number(value);
@@ -517,7 +530,7 @@ function listBuffers(
   offsets[values.length] = childValues.length;
   return {
     offsets,
-    children: [arrowBatchFromValues(childField.type, childDuckType, childValues, options)]
+    children: [arrowBatchFromValues(childField.type, childDuckType, childValues, options, childField.metadata)]
   };
 }
 
@@ -540,7 +553,7 @@ function mapBuffers(
   offsets[values.length] = entries.length;
   return {
     offsets,
-    children: [arrowBatchFromValues(childField.type, childDuckType, entries, options)]
+    children: [arrowBatchFromValues(childField.type, childDuckType, entries, options, childField.metadata)]
   };
 }
 
@@ -551,18 +564,22 @@ function structChildren(
   options: QuackArrowOptions
 ): Batch<unknown>[] {
   const children = getStructChildren(duckType);
+  const tuple = duckType.id === LogicalTypeId.TUPLE;
   return arrowType.children.map((field, index) => {
     const child = children[index];
     if (!child) {
       throw new QuackProtocolError(`STRUCT child ${index} is missing DuckDB metadata`);
     }
     const childValues = values.map((value) => {
+      if (tuple && Array.isArray(value)) {
+        return value[index] ?? null;
+      }
       if (value === null || Array.isArray(value) || value instanceof Uint8Array || typeof value !== "object") {
         return null;
       }
       return (value as Record<string, QuackValue>)[child.name] ?? null;
     });
-    return arrowBatchFromValues(field.type, child.type, childValues, options);
+    return arrowBatchFromValues(field.type, child.type, childValues, options, field.metadata);
   });
 }
 
@@ -587,7 +604,7 @@ function fixedSizeListChildren(
       throw new QuackProtocolError(`ARRAY values must contain exactly ${arrowType.stride} entries`);
     }
   }
-  return [arrowBatchFromValues(childField.type, childDuckType, childValues, options)];
+  return [arrowBatchFromValues(childField.type, childDuckType, childValues, options, childField.metadata)];
 }
 
 function resolveDuckType(field: Field, index: number, schema?: QuackArrowDuckTypeSchema): LogicalType {
@@ -651,7 +668,7 @@ function duckTypeFromArrowType(type: DataType): LogicalType {
       return type.unit === TimeUnit.NANOSECOND ? LogicalTypes.timeNs() : LogicalTypes.time();
     case Type.Timestamp:
       if (type.timezone) {
-        return LogicalTypes.timestampTz();
+        return type.unit === TimeUnit.NANOSECOND ? LogicalTypes.timestampTzNanos() : LogicalTypes.timestampTz();
       }
       return type.unit === TimeUnit.SECOND
         ? LogicalTypes.timestampSeconds()
@@ -718,6 +735,7 @@ function arrowValueToQuack(value: unknown, duckType: LogicalType, arrowType: Dat
     case LogicalTypeId.TIMESTAMP_MS:
     case LogicalTypeId.TIMESTAMP_NS:
     case LogicalTypeId.TIMESTAMP_TZ:
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
       return arrowTimestampToDuck(value, duckType, arrowType);
     case LogicalTypeId.INTERVAL:
       return arrowIntervalToDuck(value);
@@ -729,6 +747,10 @@ function arrowValueToQuack(value: unknown, duckType: LogicalType, arrowType: Dat
       return arrowMapToQuack(value, duckType, arrowType);
     case LogicalTypeId.STRUCT:
       return arrowStructToQuack(value, duckType, arrowType);
+    case LogicalTypeId.TUPLE:
+      return getStructChildren(duckType).map((child, index) =>
+        arrowValueToQuack((value as Record<string, unknown>)[String(index)], child.type, childArrowType(arrowType, index))
+      );
     default:
       return value instanceof Uint8Array ? value : value as QuackValue;
   }
@@ -736,7 +758,7 @@ function arrowValueToQuack(value: unknown, duckType: LogicalType, arrowType: Dat
 
 function arrowTimestampToDuck(value: unknown, duckType: LogicalType, arrowType: DataType): TimestampValue {
   const unit = duckTimestampUnit(duckType);
-  const timezone = duckType.id === LogicalTypeId.TIMESTAMP_TZ ? "utc" : undefined;
+  const timezone = duckType.id === LogicalTypeId.TIMESTAMP_TZ || duckType.id === LogicalTypeId.TIMESTAMP_TZ_NS ? "utc" : undefined;
   if (value instanceof Date) {
     return timestampFromJSDate(value, unit, timezone);
   }
@@ -832,6 +854,7 @@ function duckTimestampUnit(type: LogicalType): TimestampValue["unit"] {
     case LogicalTypeId.TIMESTAMP_MS:
       return "millis";
     case LogicalTypeId.TIMESTAMP_NS:
+    case LogicalTypeId.TIMESTAMP_TZ_NS:
       return "nanos";
     default:
       return "micros";
@@ -975,7 +998,8 @@ function extractionOptions<T extends QuackArrowOptions>(options: T): QuackArrowO
     ...(options.useBigInt === undefined ? {} : { useBigInt: options.useBigInt }),
     ...(options.useBigIntTimestamp === undefined ? {} : { useBigIntTimestamp: options.useBigIntTimestamp }),
     ...(options.useMap === undefined ? {} : { useMap: options.useMap }),
-    ...(options.useProxy === undefined ? {} : { useProxy: options.useProxy })
+    ...(options.useProxy === undefined ? {} : { useProxy: options.useProxy }),
+    ...(options.useGeoJSON === undefined ? {} : { useGeoJSON: options.useGeoJSON })
   };
 }
 

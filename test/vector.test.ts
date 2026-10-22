@@ -1,8 +1,9 @@
 import { describe, expect, it } from "vitest";
 import { BinaryReader, BinaryWriter } from "../src/binary";
 import { column, dataChunk } from "../src/builders";
-import { LogicalTypes } from "../src/logical-types";
-import { decodeDataChunk, decimalToString, encodeDataChunk, rowsFromChunk } from "../src/vector";
+import { QuackUnsupportedTypeError } from "../src/errors";
+import { logicalType, LogicalTypeId, LogicalTypes } from "../src/logical-types";
+import { decodeDataChunk, decodeVector, decimalToString, encodeDataChunk, rowsFromChunk, VectorType } from "../src/vector";
 import type { DecimalValue } from "../src/vector";
 
 describe("DataChunk and vector codecs", () => {
@@ -36,5 +37,38 @@ describe("DataChunk and vector codecs", () => {
     expect(rows[2]?.pair).toEqual(["c", "d"]);
     expect(rows[0]?.point).toEqual({ x: 1, y: "a" });
     expect(rows[2]?.point).toEqual({ x: 3, y: null });
+  });
+
+  it("decodes the pre-2.0 string list layout", () => {
+    const writer = new BinaryWriter();
+    writer.writeObject((object) => {
+      object.writeField(100, () => object.writeBool(true));
+      object.writeField(101, () => object.writeBlob(new Uint8Array([0b01, 0, 0, 0, 0, 0, 0, 0])));
+      object.writeField(102, () =>
+        object.writeList([new TextEncoder().encode("a"), new Uint8Array()], (bytes) => object.writeStringBytes(bytes))
+      );
+    });
+    const decoded = decodeVector(new BinaryReader(writer.toUint8Array()), LogicalTypes.varchar(), 2);
+    expect(decoded.values).toEqual(["a", null]);
+  });
+
+  it("round-trips TUPLE values as arrays", () => {
+    const tuple = LogicalTypes.tuple([LogicalTypes.integer(), LogicalTypes.varchar()]);
+    const chunk = dataChunk([column(tuple, [[1, "a"], null, [null, "c"]], "t")]);
+    const writer = new BinaryWriter();
+    encodeDataChunk(writer, chunk);
+    expect(rowsFromChunk(decodeDataChunk(new BinaryReader(writer.toUint8Array())), ["t"])).toEqual([
+      { t: [1, "a"] },
+      { t: null },
+      { t: [null, "c"] }
+    ]);
+  });
+
+  it("rejects shredded VARIANT vectors", () => {
+    const writer = new BinaryWriter();
+    writer.writeObject((object) => object.writeField(90, () => object.writeUleb(VectorType.SHREDDED)));
+    expect(() => decodeVector(new BinaryReader(writer.toUint8Array()), logicalType(LogicalTypeId.VARIANT), 1)).toThrow(
+      QuackUnsupportedTypeError
+    );
   });
 });

@@ -4,13 +4,17 @@ TypeScript client and binary codecs for DuckDB's experimental Quack protocol.
 
 This package implements the Quack HTTP transport, DuckDB `BinarySerializer`
 field/object encoding, logical type metadata, `DataChunk` decoding, and flat
-`DataChunk` encoding for append workloads. It is ESM-only, has no runtime
-dependencies, and uses the standard `fetch` API, so it can run in modern
-browsers, Node, and other runtimes with a compatible fetch implementation.
+`DataChunk` encoding for append workloads. It is ESM-only, depends only on
+[`@uwdata/flechette`](https://github.com/uwdata/flechette) for Arrow support,
+and uses the standard `fetch` API, so it can run in modern browsers, Node, and
+other runtimes with a compatible fetch implementation.
 
 Quack is still experimental upstream. The protocol is tightly coupled to
-DuckDB's internal binary serialization format. The implementation here targets
-the wire format documented in
+DuckDB's internal binary serialization format. This SDK speaks **Quack protocol
+version 3**, as served by DuckDB **v2.0.0** and later. Servers that only speak
+earlier protocol versions (DuckDB 1.5.x) are not supported; use SDK `0.2.x`
+for those. The implementation follows the upstream sources pinned as git
+submodules under [`references/`](#reference-sources) and the
 [Quack protocol analysis](https://gist.github.com/tobilg/9ced9d08f6141b723f26cf205d5b9ece).
 
 ## Status
@@ -20,12 +24,15 @@ Implemented:
 - Connection string parsing for bare hosts like `localhost:9494`, DuckDB-style
   Quack URIs like `quack:host:port`, bracketed IPv6 hosts, and direct
   `http://` or `https://` URLs.
-- HTTP `POST /quack` transport with `application/duckdb` request and response
-  bodies.
-- Connection, prepare/query, fetch, append, disconnect, success, and error
-  messages.
+- HTTP `POST /quack` transport with `application/vnd.duckdb` request and
+  response bodies.
+- All Quack v3 messages: connection, prepare, batch-indexed fetch with
+  acknowledgement indices, send-data (client data streams), cancel,
+  acknowledgement, heartbeat, disconnect, success, and typed error responses.
+- Heartbeat leases, server-side query cancellation, per-client statement
+  queueing, and request timeouts that cancel the server statement.
 - Typed query rows, row streaming, `first()`, `one()`, `values()`, scoped
-  connections, transactions, request cancellation, and request timeouts.
+  connections, and transactions.
 - SQL parameter formatting for positional `?` and named `:name` placeholders.
 - DuckDB binary object fields, required/default properties, nullable pointers,
   lists, strings, blobs, signed/unsigned LEB128 integers, and signed/unsigned
@@ -34,11 +41,13 @@ Implemented:
   array, aggregate-state, template, generic, string, any, unbound legacy, and
   geometry CRS paths needed for supported Quack traffic.
 - Result `DataChunk` decoding for flat, constant, dictionary, and sequence
-  vectors.
+  vectors, including DuckDB 2.0's length/byte-blob string vector layout.
 - Flat append chunk encoding for scalars, decimals, UUIDs, enums, temporal
-  values, intervals, strings, blobs, lists/maps, structs, and arrays.
-- Row-oriented append helpers for common application code, plus low-level
-  protocol exports under `@quack-protocol/sdk/protocol`.
+  values, intervals, strings, blobs, lists/maps, structs, tuples, and arrays.
+- Atomic appends through `INSERT … SELECT * FROM scan_data_from_quack_client(…)`
+  and `SEND_DATA` batches, returning the inserted row count.
+- Row-oriented and Arrow append helpers for common application code, plus
+  low-level protocol exports under `@quack-protocol/sdk/protocol`.
 
 ## Installation
 
@@ -77,10 +86,23 @@ try {
 - `clientPlatform`: optional platform string; defaults to the runtime user
   agent or `quack-ts`.
 - `minSupportedQuackVersion` and `maxSupportedQuackVersion`: protocol version
-  range, defaulting to version `1`.
+  range, defaulting to version `3`.
+- `heartbeatTimeoutSeconds`: lease timeout requested from the server, default
+  `60`. The server drops connections that send no request for this long.
+- `heartbeat`: send heartbeat requests while the client is idle, default
+  `true`. The timer renews the lease at about a third of the timeout and does
+  not keep a Node process alive.
+- `clientId`: optional stable client identifier (at least 4 characters) the
+  server uses for reconnect bookkeeping.
+- `acknowledgeResults`: acknowledge each fully received result so the server
+  can release its reconnect cache (only relevant when the server sets
+  `quack_enable_reconnects`), default `false`.
 - `fetch`: custom fetch implementation.
 - `headers`: additional HTTP headers.
-- `ssl`: force non-HTTP connection strings to resolve to `https://`.
+- `ssl`: transport for `quack:` and bare-host connection strings. `true`
+  forces HTTPS, `false` forces HTTP. By default the client follows DuckDB:
+  HTTP for `localhost`, `127.0.0.1`, and `::1`, HTTPS for every other host.
+  `http://` and `https://` URLs always keep their scheme.
 - `signal`: abort signal used by the initial connection request.
 - `timeoutMs`: timeout in milliseconds for the initial connection request.
 
@@ -99,6 +121,22 @@ await QuackClient.connect("quack://localhost:9494", { authToken: "super_secret" 
 await QuackClient.connect("http://localhost:9494", { authToken: "super_secret" });
 ```
 
+Like DuckDB, `quack:` and bare-host connection strings use HTTPS for every host
+other than `localhost`, `127.0.0.1`, and `::1`, matching `quack_serve()`, which
+serves HTTPS on non-local addresses by default (and only listens on them when
+started with `allow_other_hostname := true`):
+
+```ts
+await QuackClient.connect("db.example.com", { authToken }); // https://db.example.com:9494
+await QuackClient.connect("quack:10.0.0.5", { authToken, ssl: false }); // http://10.0.0.5:9494
+```
+
+The server certificate must be trusted by the runtime's `fetch`. DuckDB
+clients can pin a self-signed certificate by fingerprint, but `fetch` cannot,
+so serve a certificate from a trusted CA (`quack_serve(…, ssl_cert_file := …,
+ssl_key_file := …)`) or put a TLS-terminating proxy in front of the server. A
+server started with `disable_ssl := true` needs `ssl: false` on the client.
+
 Use `withConnection()` when a connection should be scoped to one operation:
 
 ```ts
@@ -116,7 +154,8 @@ After connecting, server metadata is available as `client.info`:
 ```ts
 console.log(client.info?.serverDuckdbVersion);
 console.log(client.info?.serverPlatform);
-console.log(client.info?.quackVersion);
+console.log(client.info?.quackVersion); // 3n
+console.log(client.info?.heartbeatTimeoutSeconds); // lease accepted by the server
 ```
 
 ## Query Results
@@ -162,11 +201,32 @@ await client.one<ItemRow>("SELECT * FROM items WHERE id = ?", [1]); // exactly o
 await client.values<bigint>("SELECT i FROM range(10) t(i)"); // first-column values
 ```
 
-Pass `signal` or `timeoutMs` to query, fetch, append, and disconnect calls:
+Pass `signal` or `timeoutMs` to query, fetch, append, and disconnect calls.
+When a request is aborted or times out, the client also cancels the statement
+on the server:
 
 ```ts
 await client.query("SELECT * FROM slow_table", { timeoutMs: 30_000 });
 ```
+
+`cancel()` interrupts the statement currently running on the client:
+
+```ts
+const running = client.query("SELECT * FROM huge_table");
+await client.cancel(); // resolves to false when nothing is running
+await running; // rejects with QuackServerError "Interrupted: query was cancelled"
+```
+
+The server sends up to `quack_prepare_inline_rows` rows (24576 by default) in
+the prepare response and the rest in fetch batches. Pass `inlineRows` to
+change that per query, for example `{ inlineRows: 0 }` to stream everything
+through fetch batches.
+
+A Quack connection runs one statement at a time, and the server cancels a
+running statement when the next one starts. The client therefore queues
+statements issued concurrently on the same instance, so
+`Promise.all([client.query(a), client.query(b)])` is safe. Use separate
+clients when statements should actually run in parallel.
 
 For chunk-by-chunk processing, use `stream()`. For row-by-row processing, use
 `streamRows()`:
@@ -180,6 +240,11 @@ for await (const row of client.streamRows<{ id: bigint }>("SELECT i AS id FROM r
   console.log(row.id);
 }
 ```
+
+Breaking out of a stream loop cancels the rest of the result on the server.
+Streams release the statement queue between fetch batches, so a statement
+started on the same client before a stream is drained interrupts that stream:
+its next fetch throws a `QuackProtocolError`.
 
 Transactions use the existing connection and automatically roll back when the
 callback throws:
@@ -213,7 +278,9 @@ console.log(table.toArray());
 
 `queryArrow()` accepts the same SQL parameter forms as `query()`, plus
 Flechette extraction options: `useDate`, `useDecimalInt`, `useBigInt`,
-`useBigIntTimestamp`, `useMap`, and `useProxy`.
+`useBigIntTimestamp`, `useMap`, `useProxy`, and `useGeoJSON`. `GEOMETRY`
+columns are tagged as `geoarrow.wkb`, so `useGeoJSON: true` returns GeoJSON
+geometry objects instead of WKB bytes.
 
 Use `queryArrowIPC()` to collect results as Arrow IPC bytes:
 
@@ -246,6 +313,17 @@ import {
 
 ## Appending Data
 
+Quack v3 appends data by running an `INSERT INTO <table> SELECT * FROM
+scan_data_from_quack_client(…)` statement and streaming the rows to it in
+`SEND_DATA` batches. All append helpers therefore:
+
+- insert everything passed in one call atomically: either all rows are
+  inserted or none,
+- match columns by position against the target table,
+- resolve the target table like SQL does, so `TEMP` tables and the current
+  transaction are visible,
+- resolve to the number of inserted rows.
+
 For application code, `appendRows()` is the most convenient append API:
 
 ```ts
@@ -266,7 +344,7 @@ await client.query(`
   )
 `);
 
-await client.appendRows(
+const inserted = await client.appendRows(
   "target_table",
   [
     { id: 1, label: "a", amount: "12.34" },
@@ -283,15 +361,19 @@ await client.appendRows(
 );
 ```
 
-Use a table reference object for schema-qualified appends:
+Use a table reference object for schema- or catalog-qualified appends:
 
 ```ts
 await client.appendRows(
-  { schema: "analytics", table: "items" },
+  { catalog: "warehouse", schema: "analytics", table: "items" },
   rows,
   { columns, batchSize: 1000 }
 );
 ```
+
+`batchSize` controls how many rows are encoded per local `DataChunk`. On the
+wire, chunks are split to at most 2048 rows and grouped into `SEND_DATA`
+batches automatically.
 
 For low-level append workloads, build a DuckDB `DataChunk` directly:
 
@@ -306,10 +388,12 @@ const chunk = dataChunk([
 await client.append("target_table", chunk);
 ```
 
-`append()` also accepts schema-qualified table references:
+`append()` also accepts schema-qualified table references and arrays of
+chunks with identical column types, which are inserted by one statement:
 
 ```ts
 await client.append({ schema: "analytics", table: "items" }, chunk);
+await client.append("target_table", [chunk1, chunk2]);
 ```
 
 Arrow tables and Arrow IPC bytes can also be appended:
@@ -352,6 +436,11 @@ enums, UUIDs, or temporal precision.
 The builder keeps column names on the local chunk for row materialization, but
 Quack append uses the target table schema and column order.
 
+The append statement declares its column types with SQL type text rendered by
+`logicalTypeToSql()` (for example `DECIMAL(10,2)` or
+`STRUCT("a" INTEGER, "b" VARCHAR[])`), and DuckDB casts them to the table's
+column types where needed.
+
 ## Logical Types
 
 Common helpers are available through `LogicalTypes`:
@@ -384,6 +473,7 @@ LogicalTypes.timestampSeconds();
 LogicalTypes.timestampMillis();
 LogicalTypes.timestampNanos();
 LogicalTypes.timestampTz();
+LogicalTypes.timestampTzNanos();
 LogicalTypes.interval();
 LogicalTypes.decimal(18, 2);
 LogicalTypes.list(LogicalTypes.integer());
@@ -392,6 +482,7 @@ LogicalTypes.struct([
   { name: "id", type: LogicalTypes.integer() },
   { name: "label", type: LogicalTypes.varchar() }
 ]);
+LogicalTypes.tuple([LogicalTypes.integer(), LogicalTypes.varchar()]);
 LogicalTypes.array(LogicalTypes.integer(), 3);
 LogicalTypes.enum(["sad", "ok", "happy"]);
 LogicalTypes.geometry();
@@ -417,6 +508,11 @@ Decoded rows use JavaScript primitives where they are lossless:
 - `VARCHAR`, `CHAR`, and `ENUM` become `string`.
 - `BLOB`, `BIT`, and `GEOMETRY` become `Uint8Array`.
 - `UUID` becomes a canonical UUID string.
+- `TUPLE` (DuckDB 2.0's unnamed struct, e.g. `(1, 'a')`) becomes an array in
+  member order; `STRUCT` becomes an object.
+- `VARIANT` is returned in DuckDB's internal storage layout (`keys`,
+  `children`, `values`, `data`); cast it to `VARCHAR` or `JSON` in SQL for
+  readable values.
 - `NULL` becomes `null`.
 
 DuckDB-specific values are represented as tagged objects:
@@ -449,7 +545,7 @@ type TimestampValue = {
   kind: "timestamp";
   unit: "seconds" | "millis" | "micros" | "nanos";
   value: bigint;
-  timezone?: "utc";
+  timezone?: "utc"; // TIMESTAMPTZ (micros) and TIMESTAMPTZ_NS (nanos)
 };
 
 type IntervalValue = {
@@ -554,7 +650,11 @@ The public error hierarchy is:
 
 - `QuackError`: base class.
 - `QuackProtocolError`: local transport, URI, codec, or client-state problem.
-- `QuackServerError`: Quack server returned an error response.
+- `QuackServerError`: Quack server returned an error response. It carries
+  `serverMessage`, the DuckDB `exceptionType` (for example `Catalog` or
+  `Binder`), `extraInfo` metadata, and `mustInvalidate`, which is set when the
+  server's database has been invalidated. After such an error the client
+  refuses further requests; the server has to be restarted.
 - `QuackUnsupportedTypeError`: a known DuckDB serialization path is outside the
   supported implementation surface.
 
@@ -566,6 +666,8 @@ Some rare DuckDB-internal serialization paths are intentionally rejected with
 rather than just the Quack envelope:
 
 - `FSST_VECTOR` compressed string vectors.
+- `SHREDDED_VECTOR` VARIANT vectors (cast VARIANT values to `VARCHAR` or `JSON`
+  in SQL instead).
 - `ExtensionTypeInfo` metadata attached to logical types.
 - `UNBOUND_TYPE_INFO` when serialized with a `ParsedExpression` field.
 - `INTEGER_LITERAL_TYPE_INFO` when serialized with a DuckDB `Value` field.
@@ -588,7 +690,7 @@ Defaults:
 
 - `QUACK_SERVER_URI=quack:localhost`
 - `QUACK_AUTH_TOKEN=super_secret`
-- `QUACK_EXTENSION_REPOSITORY=core_nightly`
+- `QUACK_EXTENSION_REPOSITORY=core`
 - `DUCKDB_BIN=duckdb`
 
 Override them as needed:
@@ -619,7 +721,8 @@ Additional server environment variables:
 - `npm run test`: runs unit tests for URI parsing, binary codecs, message
   codecs, logical type handling, and chunk encoding/decoding.
 - `npm run test:watch`: runs Vitest in watch mode.
-- `npm run check:duckdb`: verifies the local DuckDB CLI is at least `1.5.2`.
+- `npm run check:duckdb`: verifies the local DuckDB CLI (`DUCKDB_BIN`, default
+  `duckdb`) is at least `2.0.0`.
 - `npm run serve:quack`: starts a local DuckDB Quack server.
 - `npm run test:integration`: runs the live integration suite through
   `vitest.integration.config.ts`.
@@ -652,12 +755,32 @@ Integration environment variables:
 - `QUACK_SERVER_START_TIMEOUT_MS`: readiness timeout, defaulting to `30000`.
 
 Current integration coverage includes authentication, URI handling, connection
-lifecycle, connection metadata, query result metadata, parameterized query
-helpers, empty result sets, fetch pagination, chunk and row streaming, large
-results, transactions, scalar result decoding, nested result decoding, scalar
-append, nested append, row-oriented append, schema-qualified append, zero-row
-append chunks, concurrency, and server error responses.
+lifecycle, connection metadata, protocol version and heartbeat negotiation,
+heartbeat lease renewal and expiry, query result metadata, parameterized query
+helpers, empty result sets, multi-batch fetch, chunk and row streaming, stream
+interruption and early exit, query cancellation and timeouts, large results,
+transactions, scalar and nested result decoding, scalar, nested, row-oriented,
+Arrow, schema-qualified, multi-batch, atomic, transactional, and zero-row
+appends, statement queueing, concurrency, and typed server error responses.
 
-CI and release workflows install DuckDB CLI `v1.5.2` from
-`https://install.duckdb.org/v1.5.2/duckdb_cli-linux-amd64.zip` and run the live
-integration suite before a release is published.
+CI and release workflows install DuckDB CLI `v2.0.0` from
+`https://install.duckdb.org/v2.0.0/duckdb-cli-linux-amd64.tar.gz` and run the
+live integration suite before a release is published.
+
+## Reference Sources
+
+The upstream sources this SDK is ported from are pinned as git submodules
+under `references/`. They are not built or published:
+
+- `references/duckdb-quack`: the Quack extension (message definitions in
+  `src/include/quack_message.hpp`, serialization in
+  `src/serialize_quack_message.cpp`, server handling in `src/quack_server.cpp`).
+- `references/duckdb`: DuckDB `v2.0-cyanoptera` (vector, `DataChunk`, and
+  logical type serialization), cloned shallow.
+- `references/flechette`: Flechette `v2.7.0`.
+
+Fetch them after cloning with:
+
+```sh
+git submodule update --init
+```

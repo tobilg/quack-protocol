@@ -8,12 +8,15 @@ on:
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
   publish:
     name: Build, test, and publish
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # npm trusted publishing exchanges the GitHub OIDC token for a short-lived publish credential
+      id-token: write
 
     steps:
       - name: Checkout
@@ -27,9 +30,25 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: 22
+          # Node 24 ships npm 11, which trusted publishing requires (npm >= 11.5.1)
+          node-version: 24
           registry-url: https://registry.npmjs.org
-          cache: pnpm
+          # no dependency cache in release builds, as npm recommends for trusted publishing
+          package-manager-cache: false
+
+      - name: Check npm version
+        run: |
+          set -euo pipefail
+          version="$(npm --version)"
+          echo "npm ${version}"
+          node -e '
+            const [major, minor, patch] = process.argv[1].split(".").map(Number);
+            const ok = major > 11 || (major === 11 && (minor > 5 || (minor === 5 && patch >= 1)));
+            if (!ok) {
+              console.error(`Trusted publishing requires npm >= 11.5.1, found ${process.argv[1]}`);
+              process.exit(1);
+            }
+          ' "${version}"
 
       - name: Validate release tag
         run: |
@@ -64,9 +83,8 @@ jobs:
           duckdb_dir="${RUNNER_TEMP}/duckdb"
           mkdir -p "${duckdb_dir}"
 
-          curl -fsSL "https://install.duckdb.org/v1.5.2/duckdb_cli-linux-amd64.zip" \
-            -o "${duckdb_dir}/duckdb_cli-linux-amd64.zip"
-          unzip -q "${duckdb_dir}/duckdb_cli-linux-amd64.zip" -d "${duckdb_dir}"
+          curl -fsSL "https://install.duckdb.org/v2.0.0/duckdb-cli-linux-amd64.tar.gz" \
+            | tar -xzf - -C "${duckdb_dir}"
           chmod +x "${duckdb_dir}/duckdb"
 
           echo "${duckdb_dir}" >> "${GITHUB_PATH}"
@@ -79,10 +97,10 @@ jobs:
       - name: Check package contents
         run: pnpm pack --dry-run
 
+      # Trusted publishing (OIDC): no NPM_TOKEN; npm adds provenance automatically.
+      # Requires a trusted publisher on npmjs.com for tobilg/quack-protocol, workflow npm-publish.yml.
       - name: Publish
-        run: pnpm publish --access public --provenance --no-git-checks
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --access public
 
   deploy-documentation:
     name: Generate and deploy API documentation
